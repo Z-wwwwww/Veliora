@@ -1,0 +1,11 @@
+# Gradle / 构建产物
+.gradle/
+.kotlin/
+build/
+local.properties
+
+# 由 scripts/build-apk.sh 从项目根同步生成
+app/src/main/assets/
+
+# 本地自签名密钥（首次构建自动生成）
+keystore/

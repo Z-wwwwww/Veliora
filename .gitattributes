@@ -1,0 +1,7 @@
+# 批处理脚本必须使用 CRLF 换行，否则 cmd 解析会错位
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# shell 脚本必须使用 LF，否则 macOS/Linux 下 bash 解析失败
+*.sh text eol=lf
+*.command text eol=lf

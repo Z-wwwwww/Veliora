@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Veliora</title>
+    <link rel="icon" href="image/logo.png">
+    <link rel="stylesheet" href="css/tv.css?v=18">
+</head>
+<body>
+
+    <!-- 顶部导航 -->
+    <header class="tv-topbar" id="topbar">
+        <div class="tv-logo"><img src="image/logo.png" alt="">Veliora</div>
+        <nav class="tv-nav" id="navMenu">
+            <button class="focusable active" data-nav="home">首页</button>
+            <button class="focusable" data-nav="discover">发现</button>
+            <button class="focusable" data-nav="search"><svg class="mi" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg> 搜索</button>
+            <button class="focusable icon-btn" data-nav="history" id="navHistory" title="观看历史" aria-label="观看历史">
+                <!-- Material Design Icons: history -->
+                <svg viewBox="0 0 24 24"><path d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6a7 7 0 1 1 7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.96 8.96 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+            </button>
+            <button class="focusable" data-nav="settings"><svg class="mi" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg> 设置</button>
+        </nav>
+        <div class="tv-clock" id="clock">--:--</div>
+    </header>
+
+    <!-- 首页 -->
+    <main class="tv-view active" id="viewHome">
+        <section class="tv-hero" id="hero">
+            <div class="tv-hero-bg" id="heroBg"></div>
+            <div class="tv-hero-bg-sharp" id="heroBgSharp"></div>
+            <h1 class="tv-hero-title" id="heroTitle">Veliora</h1>
+            <div class="tv-hero-meta" id="heroMeta"></div>
+            <p class="tv-hero-desc" id="heroDesc">遥控器方向键浏览 · OK 键播放 · 返回键退出</p>
+            <div class="tv-hero-actions">
+                <button class="tv-btn primary focusable" id="heroPlay" data-hero="1"><svg class="mi" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg> 播放</button>
+                <button class="tv-btn focusable" id="heroInfo"><svg class="mi" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg> 更多信息</button>
+            </div>
+        </section>
+        <div class="tv-rows" id="rows"></div>
+    </main>
+
+    <!-- 发现（豆瓣多维筛选：形态 × 类型 × 地区 × 标签可组合；
+         深处按返回时 discFilters 以半透明浮层形式弹出） -->
+    <section class="tv-view" id="viewDiscover">
+        <div id="discFilters">
+            <div class="chips" id="discForm"></div>
+            <div class="chips" id="discGenre"></div>
+            <div class="chips" id="discCountry"></div>
+            <div class="chips" id="discTags"></div>
+        </div>
+        <div class="tv-grid"><div class="grid-scroll" id="discResults"></div></div>
+    </section>
+
+    <!-- 搜索 -->
+    <section class="tv-view" id="viewSearch">
+        <div class="search-head">
+            <div class="search-box" id="searchBox"><span class="cursor">|</span></div>
+        </div>
+        <div class="chips" id="searchSuggest"></div>
+        <div class="chips" id="recentSearches"></div>
+        <div class="tv-keyboard" id="keyboard"></div>
+        <div class="tv-grid"><div class="grid-scroll" id="searchResults"></div></div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="tv-view" id="viewSettings">
+        <h2 class="set-page-title">设置</h2>
+        <div class="set-section">
+            <div class="set-title">采集源 <span class="set-sub" id="srcCount"></span></div>
+            <div class="chips" id="srcActions"></div>
+            <div class="chips" id="srcChips"></div>
+        </div>
+        <div class="set-section">
+            <div class="set-title">自定义源</div>
+            <div class="chips" id="customChips"></div>
+        </div>
+        <div class="set-section">
+            <div class="set-title">功能开关</div>
+            <div class="chips" id="toggleChips"></div>
+        </div>
+        <div class="set-section">
+            <div class="set-title">历史与配置</div>
+            <div class="chips" id="dataChips"></div>
+        </div>
+    </section>
+    <input type="file" id="importFileInput" accept=".json,application/json" style="display:none">
+
+    <!-- 详情 -->
+    <section class="tv-view" id="viewDetail">
+        <div class="detail-wrap">
+            <div class="detail-poster"><img id="detailPoster" src="" alt=""></div>
+            <div class="detail-info">
+                <h2 class="detail-title" id="detailTitle"></h2>
+                <div class="detail-meta" id="detailMeta"></div>
+                <p class="detail-desc" id="detailDesc"></p>
+                <div class="detail-section-title">播放源</div>
+                <div class="source-tabs" id="sourceTabs"></div>
+                <div class="detail-section-title">选集
+                    <span class="detail-actions">
+                        <button class="chip focusable" id="btnEpOrder"><svg class="mi" viewBox="0 0 24 24"><path d="M20 12l-1.41-1.41L13 16.17V4h-2v12.17l-5.58-5.59L4 12l8 8 8-8z"/></svg> 倒序排列</button>
+                        <button class="chip focusable" id="btnCopyLinks"><svg class="mi" viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg> 复制链接</button>
+                    </span>
+                </div>
+                <div class="episodes" id="episodes"></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- 观看历史（顶栏时钟图标打开，返回键回主页） -->
+    <section class="tv-view" id="viewHistory">
+        <h2 class="set-page-title">历史</h2>
+        <div class="history-grid" id="historyGrid"></div>
+    </section>
+
+    <!-- 加载遮罩 -->
+    <div class="tv-center hidden" id="loading">
+        <div class="tv-spinner"></div>
+        <div class="msg" id="loadingMsg">加载中…</div>
+    </div>
+
+    <!-- 提示 -->
+    <div class="tv-toast" id="toast"></div>
+
+    <!-- 遥控器提示 -->
+    <div class="tv-hint">
+        <span><b>↑↓←→</b>导航</span>
+        <span><b>OK</b>确定</span>
+        <span><b>返回</b>上一层</span>
+    </div>
+
+    <!-- ============ 底层脚本（与主项目完全一致，直接复用） ============ -->
+    <script src="libs/sha256.min.js"></script>
+    <script>window._jsSha256 = window.sha256;</script>
+    <script src="js/config.js"></script>
+    <script src="js/proxy-auth.js"></script>
+    <script src="js/customer_site.js?v=3"></script>
+    <script src="js/api.js"></script>
+    <script src="js/search.js"></script>
+    <script src="js/douban.js"></script>
+    <script src="js/password.js"></script>
+
+    <!-- 环境变量注入（PASSWORD 由服务器端替换） -->
+    <script>
+        window.__ENV__ = window.__ENV__ || {};
+        window.__ENV__.PASSWORD = "{{PASSWORD}}";
+    </script>
+
+    <!-- 电视版 UI 层（遥控器导航） -->
+    <script src="js/tv-remote.js?v=20"></script>
+</body>
+</html>
