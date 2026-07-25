@@ -16,7 +16,10 @@
     --focus-ring: #ffffff;
     --font: "Helvetica Neue", Helvetica, Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
     --radius: 4px;
-    --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+    /* 快出缓动（起步就是最快、末尾收住）。原来用的 cubic-bezier(0.25,0.1,0.25,1) 就是
+       CSS 默认的 ease —— 起步很慢，前 40ms 几乎看不出动静，在电视上就被读成「按下去有延迟」。
+       这条曲线起始斜率约 6，按下第一帧就有明显位移 */
+    --ease: cubic-bezier(0.12, 0.72, 0.2, 1);
     --tile-w: 12vw;
     --tile-min: 150px;
     --thumb-ratio: 2 / 3;
@@ -50,20 +53,21 @@ img { -webkit-user-drag: none; }
 
 .tv-nav { display: flex; align-items: center; gap: 0.6vw; margin-left: 1.5vw; }
 .tv-nav .focusable {
-    padding: 0.4em 0.9em; border-radius: 0;
+    padding: 0.45em 1.1em; border-radius: 999px;
     font-size: clamp(14px,1.05vw,18px); font-weight: 500;
     color: var(--text-dim); background: transparent; border: none; cursor: pointer;
-    transition: transform 0.2s var(--ease);
+    transition: transform 0.14s var(--ease);
+    transform-origin: center center;
 }
-.tv-nav .focusable.active { color: var(--text); font-weight: 700; }
+/* 当前所在页：不带焦点时用暗色药丸 + 白字标出来，和焦点态区分开 */
+.tv-nav .focusable.active { color: var(--text); font-weight: 700; background: rgba(255,255,255,0.16); }
 
 /* 统一图标（Material Design Icons 内联 SVG，随文字颜色，像文字字形一样内联排版） */
 .mi { width: 1.05em; height: 1.05em; fill: currentColor; vertical-align: -0.14em; }
 
-/* 纯图标导航按钮（SVG 随文字色，聚焦时用下划线线条替代文字下划线） */
+/* 纯图标导航按钮（SVG 随文字色，焦点态跟着文字色一起反白） */
 .tv-nav .icon-btn { display: inline-flex; align-items: center; justify-content: center; }
 .tv-nav .icon-btn svg { width: 1.3em; height: 1.3em; fill: currentColor; display: block; }
-.tv-nav .icon-btn.focusable.focused { box-shadow: inset 0 -2px 0 var(--focus-ring); }
 
 /* 装饰性菜单项（不可聚焦） */
 .deco { color: var(--text-dim); font-size: clamp(14px,1.05vw,18px); padding: 0.4em 0.9em; }
@@ -76,7 +80,9 @@ img { -webkit-user-drag: none; }
 /* ============================ 视图容器 ============================ */
 .tv-view { display: none; position: relative; z-index: 1; }
 .tv-view.active { display: block; }
-#viewHome { height: 100vh; overflow-y: auto; overflow-x: hidden; scroll-behavior: smooth; padding-bottom: 8vh; }
+/* 不用 scroll-behavior: smooth：浏览器的平滑滚动时长随距离变长（换排要滚 700px 时能拖到
+   400ms 以上），电视上就是「按下去等半天才动」。改由 smoothScrollTo() 固定 180ms 自己做 */
+#viewHome { height: 100vh; overflow-y: auto; overflow-x: hidden; padding-bottom: 8vh; }
 #viewHome::-webkit-scrollbar, #viewSearch::-webkit-scrollbar, #viewDetail::-webkit-scrollbar { width: 0; height: 0; }
 #viewHome, #viewSearch, #viewDetail { scrollbar-width: none; }
 
@@ -131,7 +137,7 @@ img { -webkit-user-drag: none; }
     display: inline-flex; align-items: center; gap: 10px;
     padding: 0.8em 2.2em; border-radius: var(--radius); font-size: clamp(15px,1.25vw,20px); font-weight: 700;
     border: none; cursor: pointer; background: rgba(109,109,110,0.7); color: #fff;
-    transition: transform 0.2s var(--ease);
+    transition: transform 0.14s var(--ease);
 }
 .tv-btn.primary { background: #fff; color: #000; }
 .tv-btn.focusable.focused { transform: scale(1.05); box-shadow: 0 0 0 3px var(--focus-ring); }
@@ -142,10 +148,10 @@ img { -webkit-user-drag: none; }
 .tv-rows { position: relative; margin-top: -17vh; padding-top: 1vh; overflow: visible; }
 .tv-row { margin-bottom: 1.5vh; overflow: visible; }
 .tv-row-title { font-size: clamp(15px,1.25vw,22px); font-weight: 700; margin: 0 0 0.6vh 4.5vw; color: #e5e5e5; }
-.tv-row-track { display: flex; gap: 0.5vw; padding: 1.5vh 4.5vw; transition: transform 0.4s var(--ease); will-change: transform; }
+.tv-row-track { display: flex; gap: 0.5vw; padding: 1.5vh 4.5vw; transition: transform 0.22s var(--ease); will-change: transform; }
 
 /* ---- 影视磁贴 ---- */
-.tv-tile { flex: 0 0 auto; width: var(--tile-w); min-width: var(--tile-min); cursor: pointer; transition: transform 0.3s var(--ease); transform-origin: center center; }
+.tv-tile { flex: 0 0 auto; width: var(--tile-w); min-width: var(--tile-min); cursor: pointer; transition: transform 0.16s var(--ease); transform-origin: center center; }
 .tv-tile .thumb {
     position: relative; width: 100%; aspect-ratio: var(--thumb-ratio);
     border-radius: var(--radius); overflow: hidden; background: var(--panel);
@@ -167,10 +173,18 @@ img { -webkit-user-drag: none; }
 .tv-tile.focused { transform: scale(1.32); z-index: 6; }
 .tv-tile.focused .thumb { box-shadow: 0 12px 40px rgba(0,0,0,0.8); outline: 3px solid var(--focus-ring); outline-offset: 0; }
 
-.tv-nav .focusable.focused { background: transparent; color: #fff; text-decoration: underline; text-underline-offset: 6px; box-shadow: none; }
+/* 顶栏焦点态：原来只有一条下划线，电视上隔几米根本看不出选中了哪个。
+   改成与全站一致的白底黑字 + 放大（同 .key / .chip / .source-tab 的焦点语言），
+   底部投影把药丸从顶栏的暗色渐变里托出来 */
+.tv-nav .focusable.focused {
+    background: #fff; color: #000; font-weight: 700;
+    transform: scale(1.12);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+    text-decoration: none;
+}
 
 /* ============================ 搜索 / 详情 / 发现 / 设置 ============================ */
-#viewSearch, #viewDetail, #viewDiscover, #viewSettings, #viewHistory { position: fixed; inset: 0; padding: 11vh 4.5vw 5vh; background: var(--bg); z-index: 30; overflow-y: auto; overflow-x: hidden; scroll-behavior: smooth; }
+#viewSearch, #viewDetail, #viewDiscover, #viewSettings, #viewHistory { position: fixed; inset: 0; padding: 11vh 4.5vw 5vh; background: var(--bg); z-index: 30; overflow-y: auto; overflow-x: hidden; }
 #viewDiscover::-webkit-scrollbar, #viewSettings::-webkit-scrollbar, #viewHistory::-webkit-scrollbar { width: 0; height: 0; }
 #viewDiscover, #viewSettings, #viewHistory { scrollbar-width: none; }
 .search-head { display: flex; align-items: center; gap: 2vw; margin-bottom: 3.5vh; }
@@ -178,7 +192,7 @@ img { -webkit-user-drag: none; }
 .search-box .cursor { color: var(--accent); animation: blink 1s step-end infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 .tv-keyboard { display: grid; grid-template-columns: repeat(10, 1fr); gap: 0.9vw; max-width: 62vw; margin-bottom: 4vh; }
-.key { display: flex; align-items: center; justify-content: center; gap: 0.35em; padding: 0.75em 0; border-radius: var(--radius); background: var(--panel); font-size: clamp(14px,1.25vw,20px); font-weight: 600; cursor: pointer; transition: transform 0.15s var(--ease); }
+.key { display: flex; align-items: center; justify-content: center; gap: 0.35em; padding: 0.75em 0; border-radius: var(--radius); background: var(--panel); font-size: clamp(14px,1.25vw,20px); font-weight: 600; cursor: pointer; transition: transform 0.12s var(--ease); }
 .key.wide { grid-column: span 2; }
 .key.act { color: var(--accent); }
 .key.focused { background: #fff; color: #000; transform: scale(1.1); box-shadow: 0 0 0 3px var(--focus-ring), 0 8px 20px rgba(0,0,0,0.4); }
@@ -200,13 +214,13 @@ img { -webkit-user-drag: none; }
 .detail-desc { color: var(--text-dim); font-size: clamp(13px,1.05vw,17px); line-height: 1.65; max-width: 62vw; margin-bottom: 2.5vh; font-weight: 500; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 .detail-section-title { font-size: clamp(16px,1.35vw,22px); font-weight: 700; margin: 2.2vh 0 1.3vh; }
 .source-tabs { display: flex; flex-wrap: wrap; gap: 0.8vw; margin-bottom: 1vh; }
-.source-tab { padding: 0.55em 1.4em; border-radius: 999px; background: var(--panel); font-size: clamp(13px,1.05vw,18px); font-weight: 600; cursor: pointer; transition: transform 0.15s var(--ease); color: var(--text-dim); }
+.source-tab { padding: 0.55em 1.4em; border-radius: 999px; background: var(--panel); font-size: clamp(13px,1.05vw,18px); font-weight: 600; cursor: pointer; transition: transform 0.12s var(--ease); color: var(--text-dim); }
 .source-tab.selected { background: var(--accent); color: #fff; }
 .source-tab.focused { background: #fff; color: #000; transform: scale(1.05); box-shadow: 0 0 0 3px var(--focus-ring); }
 .source-tab.loading { cursor: default; pointer-events: none; animation: tabPulse 1.4s ease-in-out infinite; }
 @keyframes tabPulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.55; } }
 .episodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 1vw; align-content: start; padding-bottom: 4vh; }
-.ep { padding: 0.8em 0; text-align: center; background: var(--panel); border-radius: var(--radius); font-size: clamp(13px,1.05vw,17px); font-weight: 600; cursor: pointer; transition: transform 0.15s var(--ease); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ep { padding: 0.8em 0; text-align: center; background: var(--panel); border-radius: var(--radius); font-size: clamp(13px,1.05vw,17px); font-weight: 600; cursor: pointer; transition: transform 0.12s var(--ease); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ep.focused { background: #fff; color: #000; transform: scale(1.08); box-shadow: 0 0 0 3px var(--focus-ring); }
 
 /* ============================ 加载 / 提示 ============================ */
@@ -229,7 +243,7 @@ img { -webkit-user-drag: none; }
 .chip {
     padding: 0.55em 1.4em; border-radius: 999px; background: var(--panel); border: none;
     font-size: clamp(13px,1.05vw,18px); font-weight: 600; cursor: pointer;
-    transition: transform 0.15s var(--ease); color: var(--text-dim); font-family: var(--font);
+    transition: transform 0.12s var(--ease); color: var(--text-dim); font-family: var(--font);
     white-space: nowrap;
 }
 .chip.on { background: var(--accent); color: #fff; }

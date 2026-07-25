@@ -173,6 +173,36 @@
         }
     }
 
+    // 纵向滚动自己做动画：浏览器的 scroll-behavior: smooth 时长随距离变长（换排要滚 700px
+    // 时能拖到 400ms 以上），按下到画面动起来之间的空白就是这么来的。固定 180ms + 快出缓动，
+    // 起步第一帧就有明显位移，节奏也不随距离变。
+    let scrollRaf = 0;
+    function smoothScrollTo(box, top, duration = 180) {
+        cancelAnimationFrame(scrollRaf);
+        const from = box.scrollTop;
+        const max = box.scrollHeight - box.clientHeight;
+        const dist = Math.max(0, Math.min(top, max)) - from;
+        if (Math.abs(dist) < 2) return;
+        const t0 = performance.now();
+        const step = () => {
+            const p = Math.min(1, (performance.now() - t0) / duration);
+            box.scrollTop = from + dist * (1 - Math.pow(1 - p, 3));   // ease-out cubic
+            if (p < 1) scrollRaf = requestAnimationFrame(step);
+        };
+        scrollRaf = requestAnimationFrame(step);
+    }
+
+    // 找到真正在滚的那个祖先容器（各视图自身滚动，发现/搜索页则可能是内层网格）
+    function scrollBox(el) {
+        let p = el.parentElement;
+        while (p && p !== document.body) {
+            const oy = getComputedStyle(p).overflowY;
+            if ((oy === 'auto' || oy === 'scroll') && p.scrollHeight > p.clientHeight + 2) return p;
+            p = p.parentElement;
+        }
+        return null;
+    }
+
     // rect 可由调用方传入（几何导航已经读过一遍），省一次强制布局
     function ensureVisible(el, rect = null) {
         // 筛选浮层内的元素固定定位，无需滚动（滚动反而会拖动底下的网格）
@@ -197,14 +227,18 @@
         const rowsEl = document.getElementById('rows');
         if (rowEl && rowsEl && rowEl === rowsEl.firstElementChild) {
             const home = document.getElementById('viewHome');
-            if (home && home.scrollTop > 0) home.scrollTo({ top: 0, behavior: 'smooth' });
+            if (home && home.scrollTop > 0) smoothScrollTo(home, 0);
             return;
         }
-        // 已经舒服地在视区里就别滚：同排左右移动占按键的绝大多数，scrollIntoView
-        // 每次都要再算一遍布局并起一段平滑滚动动画，和排内 translateX 过渡打架
+        // 已经舒服地在视区里就别滚：同排左右移动占按键的绝大多数，多余的滚动动画
+        // 会和排内 translateX 过渡打架
         const margin = window.innerHeight * 0.12;
         if (vr.top >= margin && vr.bottom <= window.innerHeight - margin) return;
-        el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+        const box = scrollBox(el);
+        if (!box) return;
+        // 把元素滚到容器垂直居中
+        const br = box.getBoundingClientRect();
+        smoothScrollTo(box, box.scrollTop + (vr.top - br.top) - (box.clientHeight - vr.height) / 2);
     }
 
     // 排的左边界、可视宽、内容总宽在这一排建好之后就不再变，但 scrollWidth / clientWidth /
@@ -336,7 +370,7 @@
         }
         // 搜索页：焦点深入结果时第一次返回先跳回键盘区，再按一次才退出
         if (state.view === 'search' && current && current.closest('#searchResults')) {
-            document.getElementById('viewSearch').scrollTo({ top: 0, behavior: 'smooth' });
+            smoothScrollTo(document.getElementById('viewSearch'), 0);
             setFocus(document.querySelector('#keyboard .key'));
             return;
         }
@@ -368,8 +402,7 @@
             default:
                 // 搜索页支持物理键盘直接输入（PC / 带键盘的遥控器）
                 if (state.view === 'search' && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-                    state.query += e.key;
-                    renderQuery();
+                    appendQuery(e.key);
                 }
         }
     });
@@ -587,6 +620,21 @@
         ...'456789'.split(''),
     ];
 
+    // 搜完一轮之后再敲字，意思一定是「重新搜一个」而不是往旧词后面接着拼。
+    // 这个标记让搜完后的第一个字自动把上一轮的词清掉，不用先摸到「清空」键。
+    let queryCommitted = false;
+    function appendQuery(ch) {
+        if (queryCommitted) { state.query = ''; queryCommitted = false; }
+        state.query += ch;
+        renderQuery();
+    }
+    // 删除/清空是明确的编辑动作：取消标记，之后按常规编辑旧词
+    function editQuery(next) {
+        queryCommitted = false;
+        state.query = next;
+        renderQuery();
+    }
+
     function buildKeyboard() {
         const kb = document.getElementById('keyboard');
         kb.innerHTML = '';
@@ -594,12 +642,12 @@
             const el = document.createElement('div');
             el.className = 'key focusable';
             el.textContent = k;
-            el.onclick = () => { state.query += k; renderQuery(); };
+            el.onclick = () => appendQuery(k);
             kb.appendChild(el);
         });
-        const space = keyBtn('空格', 'key focusable wide', () => { state.query += ' '; renderQuery(); });
-        const del = keyBtn('删除', 'key focusable wide act', () => { state.query = state.query.slice(0, -1); renderQuery(); }, 'backspace');
-        const clr = keyBtn('清空', 'key focusable', () => { state.query = ''; renderQuery(); });
+        const space = keyBtn('空格', 'key focusable wide', () => appendQuery(' '));
+        const del = keyBtn('删除', 'key focusable wide act', () => editQuery(state.query.slice(0, -1)), 'backspace');
+        const clr = keyBtn('清空', 'key focusable', () => editQuery(''));
         const go = keyBtn('搜索', 'key focusable wide act', () => runSearch(), 'search');
         kb.append(space, del, clr, go);
     }
@@ -865,7 +913,11 @@
             renderSearchResults(list, used.filter(hasCJK));
         } catch (e) {
             toast('搜索失败：' + e.message);
-        } finally { hideLoading(); }
+        } finally {
+            hideLoading();
+            // 这一轮搜完了：下次敲字自动从头开始，不再往这个词后面接
+            queryCommitted = true;
+        }
     }
 
     async function searchQueries(queries) {
@@ -1110,9 +1162,20 @@
         tabs.innerHTML = '';
         results.forEach((r, i) => {
             const t = document.createElement('div');
-            t.className = 'source-tab focusable' + (i === selectedIdx ? ' selected' : '');
-            t.textContent = (r.source_name || '源' + (i + 1)) + (r.vod_remarks ? ' · ' + r.vod_remarks : '');
-            t.onclick = () => { state.detail.selectedIdx = i; renderSourceTabs(); loadEpisodes(i); };
+            const on = i === selectedIdx;
+            t.className = 'source-tab focusable' + (on ? ' selected' : '');
+            const label = (r.source_name || '源' + (i + 1)) + (r.vod_remarks ? ' · ' + r.vod_remarks : '');
+            // 选中的那个带播放图标：提示「再按一次 OK 就开播」
+            if (on) t.innerHTML = icon('play') + ' ' + esc(label);
+            else t.textContent = label;
+            t.onclick = () => {
+                // 已选中的源再按一次 OK 就直接开播；原来会重新拉一遍同一个源的剧集，
+                // 界面上看着像没反应（详情页打开后焦点默认就停在这里）
+                if (on) { playFromDetail(); return; }
+                state.detail.selectedIdx = i;
+                renderSourceTabs();
+                loadEpisodes(i);
+            };
             tabs.appendChild(t);
         });
         // 尚未返回结果的源：灰色不可选
@@ -1227,6 +1290,27 @@
     // ============================================================
     //  7. 播放（复用 player.html，完全一致的播放底层）
     // ============================================================
+    // 详情页「直接开播」：接着上次看过的那集，没有记录就从第一集开始
+    function playFromDetail() {
+        const d = state.detail;
+        const r = d && d.results[d.selectedIdx];
+        const eps = (d && d.episodes) || [];
+        if (!r) return;
+        if (!eps.length) { toast('该源暂无可播放剧集，剧集还在加载或此源无内容'); return; }
+        const title = (d.videoInfo && d.videoInfo.title) || r.vod_name || state.query;
+        let idx = 0;
+        if (eps.length > 1) {
+            const last = store.get('viewingHistory', [])
+                .filter(h => h && h.title === title && typeof h.episodeIndex === 'number')
+                .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))[0];
+            if (last && last.episodeIndex > 0 && last.episodeIndex < eps.length) {
+                idx = last.episodeIndex;
+                toast('继续播放 第' + (idx + 1) + '集');
+            }
+        }
+        play(idx, r);
+    }
+
     function play(index, r) {
         const { episodes, videoInfo } = state.detail;
         const title = (videoInfo && videoInfo.title) || r.vod_name || state.query;

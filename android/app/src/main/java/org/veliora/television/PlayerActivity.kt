@@ -3,6 +3,7 @@ package org.veliora.television
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.SharedPreferences
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.net.TrafficStats
 import android.os.Bundle
@@ -39,8 +40,9 @@ import androidx.media3.ui.PlayerView
  * HLS 由 Media3 原生解析，MediaCodec 硬解直通，4K/HEVC 能力取决于芯片而非 WebView。
  *
  * 遥控器约定（控制条隐藏时）：
- * - 左/右：按一下快退/快进 15 秒（连按累加）；按住转为连续扫描，倍速 8x→16x→32x→64x 递增，
- *   松手才落点。OK：暂停/继续并唤出控制条
+ * - 左/右：按一下快退/快进 15 秒（连按累加）；按住转为连续扫描，倍速 8x→…→256x 递增
+ *   （按片长封顶，整片最快 12 秒扫完），松手才落点。全程底部显示进度条 + 目标时间 + 倍速。
+ *   OK：暂停/继续并唤出控制条
  * - 上/下：唤出控制条（内含上一集/下一集/进度条，方向键导航）
  * - 菜单键 / 长按 OK：清晰度选择（仅多码率源），手动锁档并记忆偏好
  * - 返回：控制条可见则先收起，否则退出回到选片页
@@ -60,14 +62,22 @@ class PlayerActivity : Activity() {
         private const val MIN_RESUME_MS = 10_000L   // 进度小于此值不续播
         private const val NEAR_END_MS = 30_000L     // 距结尾小于此值视为已看完
 
-        // ---------- 快进/快退节奏（对齐 Apple TV / Android TV 主流播放器）----------
-        // 短按一次跳 15 秒；连按累加成一次 seek；按住转为连续扫描，倍速随时长递增。
+        // ---------- 快进/快退节奏 ----------
+        // 短按一次跳 15 秒；连按累加成一次 seek；按住转为连续扫描，倍速逐档抬升。
         private const val SEEK_STEP_MS = 15_000L
-        private const val SEEK_LONG_PRESS_MS = 500L    // 按住超过此时长转入连续扫描
+        private const val SEEK_LONG_PRESS_MS = 350L    // 按住超过此时长转入连续扫描
         private const val SEEK_TICK_MS = 100L          // 扫描节拍
         private const val SEEK_COMMIT_DELAY_MS = 250L  // 连按合并窗口：停手这么久才真正 seek
-        // 扫描硬上限：纯兜底（个别遥控器只发 DOWN 不发 UP）。
-        // 取 30s 是因为 64x 下按住 30 秒≈跳 29 分钟，正常人不会按这么久，卡住也不至于直接冲到片尾
+        // 倍速档位与切档时刻（进入扫描后计时）：档位给得比一般手机播放器陡，
+        // 电视上用户就是要「按住不放，几秒钟跨过大半集」
+        // 最后一档给得很大是故意的：4.5 秒之后实际由下面的「整片扫完时长」封顶，
+        // 于是不管 20 分钟的剧集还是 2 小时的电影，按住十几秒都能从头扫到尾
+        private val SEEK_RATES = intArrayOf(8, 16, 32, 64, 128, 1024)
+        private val SEEK_RATE_AT_MS = longArrayOf(0, 600, 1_200, 2_000, 3_000, 4_500)
+        // 倍速上限 = 片长 / 这个时间：整片最快 12 秒扫完，短片也就不会一眨眼冲过片尾
+        private const val SEEK_FULL_SWEEP_MS = 12_000L
+        private const val SEEK_RATE_UNKNOWN_MAX = 64   // 时长未知（直播等）无法封顶，保守限速
+        // 扫描硬上限：纯兜底（个别遥控器只发 DOWN 不发 UP）
         private const val SEEK_SCAN_MAX_MS = 30_000L
 
         // 清晰度偏好（按分辨率高度记忆，0=自动；下划线前缀避免与进度存储的 URL 键冲突）
@@ -80,6 +90,10 @@ class PlayerActivity : Activity() {
     private lateinit var overlay: TextView
     private lateinit var loadingBox: LinearLayout
     private lateinit var speedText: TextView
+    // 快进浮层：底部进度条 + 目标时间 / 总时长 / 倍速（快进时要能看见落点在整片的位置）
+    private lateinit var seekBox: LinearLayout
+    private lateinit var seekText: TextView
+    private lateinit var seekBar: ProgressBar
     private lateinit var prefs: SharedPreferences
     private var player: ExoPlayer? = null
     private var episodes: List<String> = emptyList()
@@ -87,6 +101,7 @@ class PlayerActivity : Activity() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val hideOverlay = Runnable { overlay.visibility = View.GONE }
+    private val hideSeekBox = Runnable { seekBox.visibility = View.GONE }
 
     // ---------- 缓冲加载层（转圈 + 实时下载网速） ----------
     private var lastRxBytes = 0L
@@ -172,6 +187,30 @@ class PlayerActivity : Activity() {
             textSize = 16f
             text = "加载中…"
         }
+        // ---- 快进浮层：目标时间 + 进度条（对齐主流电视播放器：快进时进度条常驻可见）----
+        seekText = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 20f
+            setShadowLayer(8f, 0f, 2f, Color.BLACK)
+        }
+        seekBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000
+            // progress = 快进目标点（红），secondaryProgress = 当前实际播放位置（浅灰）
+            progressTintList = ColorStateList.valueOf(Color.parseColor("#E50914"))
+            secondaryProgressTintList = ColorStateList.valueOf(Color.parseColor("#8AFFFFFF"))
+            progressBackgroundTintList = ColorStateList.valueOf(Color.parseColor("#59FFFFFF"))
+        }
+        seekBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(36, 22, 36, 26)
+            setBackgroundColor(0xA6000000.toInt())
+            addView(seekText, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(seekBar, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 18).apply { topMargin = 18 })
+            visibility = View.GONE
+        }
+
         loadingBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -200,6 +239,15 @@ class PlayerActivity : Activity() {
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.START
             ).apply { setMargins(40, 40, 0, 0) }
+        )
+        // 底部快进浮层：左右留出电视安全区，别贴边
+        root.addView(
+            seekBox,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM
+            ).apply { setMargins(70, 0, 70, 60) }
         )
         root.addView(
             loadingBox,
@@ -320,26 +368,35 @@ class PlayerActivity : Activity() {
     }
 
     // ---------- 快进/快退 ----------
-    // 主流电视播放器（Apple TV、Android TV、Netflix）的一致做法：
+    // 主流电视播放器（Apple TV、Android TV、以及云视听极光 / 奇异果这类国内 TV 端）
+    // 共同的那套手感：
     //   1) 按一下 = 定量跳一步（10~15 秒），不是「按住才动」
     //   2) 连按 = 累加成一次 seek，界面立刻显示目标点，手停下来才真的跳
-    //   3) 按住 = 连续扫描，倍速随按住时长递增，松手落点
+    //   3) 按住 = 连续扫描，倍速逐档抬升，松手落点
+    //   4) 整个过程底部常驻进度条 + 目标时间 + 倍速，落点在整片里的位置一眼可见
     // 我们把系统的自动重复（repeatCount>0）全部丢掉，扫描完全由自己的节拍驱动，
     // 这样速度不受各家遥控器重复率影响，且整个长按只产生一次 seek。
 
     private fun seekScanRate(): Int {
+        if (seekScanStartMs == 0L) return 0
         val held = android.os.SystemClock.elapsedRealtime() - seekScanStartMs
-        return when {
-            seekScanStartMs == 0L -> 0
-            held < 1_500 -> 8
-            held < 3_000 -> 16
-            held < 5_000 -> 32
-            else -> 64
+        var rate = SEEK_RATES[0]
+        for (i in SEEK_RATES.indices) {
+            if (held >= SEEK_RATE_AT_MS[i]) rate = SEEK_RATES[i]
+        }
+        val dur = player?.duration ?: 0
+        return if (dur > 0) {
+            val cap = (dur / (SEEK_FULL_SWEEP_MS / 1000)).toInt().coerceAtLeast(SEEK_RATES[0])
+            rate.coerceAtMost(cap)
+        } else {
+            rate.coerceAtMost(SEEK_RATE_UNKNOWN_MAX)
         }
     }
 
     private fun onSeekKeyDown(direction: Int) {
         val exo = player ?: return
+        // 遥控器带独立快进键时控制条可能正开着，两套底部 UI 会叠在一起
+        if (playerView.isControllerFullyVisible) playerView.hideController()
         if (seekTargetMs < 0) seekTargetMs = exo.currentPosition
         seekDirection = direction
         handler.removeCallbacks(seekCommit)
@@ -386,25 +443,39 @@ class PlayerActivity : Activity() {
         seekTargetMs = -1L
         if (exo == null || target < 0) return
         exo.seekTo(target)
-        handler.removeCallbacks(hideOverlay)
-        handler.postDelayed(hideOverlay, 1200)
+        // 落点后进度条再停留一会儿，让人看清跳到哪了
+        handler.removeCallbacks(hideSeekBox)
+        handler.postDelayed(hideSeekBox, 1500)
     }
 
     private fun showSeekOverlay() {
         val exo = player ?: return
         val dur = exo.duration
-        val delta = seekTargetMs - exo.currentPosition
+        val pos = exo.currentPosition
+        val delta = seekTargetMs - pos
         val arrow = if (seekDirection >= 0) "▶▶" else "◀◀"
         val sign = if (delta >= 0) "+" else "-"
         val rate = seekScanRate()
-        overlay.text = buildString {
+        seekText.text = buildString {
             append(arrow).append(' ').append(formatTime(seekTargetMs))
             if (dur > 0) append(" / ").append(formatTime(dur))
-            append("   ").append(sign).append(Math.abs(delta) / 1000).append(" 秒")
-            if (rate > 0) append("   ").append(rate).append("x")
+            append("    ").append(sign).append(Math.abs(delta) / 1000).append(" 秒")
+            if (rate > 0) append("    ").append(rate).append("x")
         }
-        overlay.visibility = View.VISIBLE
-        handler.removeCallbacks(hideOverlay)
+        // 进度条：secondaryProgress 是画在 progress 底下的，所以红条取两点中较小的那个、
+        // 浅色取较大的那个 —— 「当前位置 ↔ 落点」之间就总能露出一段浅色带：
+        // 快进时它是红条右侧要跳过去的这段，快退时它是被放弃的这段。
+        if (dur > 0) {
+            val lo = Math.min(pos, seekTargetMs)
+            val hi = Math.max(pos, seekTargetMs)
+            seekBar.visibility = View.VISIBLE
+            seekBar.progress = (lo * 1000 / dur).toInt().coerceIn(0, 1000)
+            seekBar.secondaryProgress = (hi * 1000 / dur).toInt().coerceIn(0, 1000)
+        } else {
+            seekBar.visibility = View.GONE   // 直播/未知时长，只显示时间
+        }
+        seekBox.visibility = View.VISIBLE
+        handler.removeCallbacks(hideSeekBox)
     }
 
     private fun formatTime(ms: Long): String {
@@ -631,6 +702,7 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(seekLongPress)
         handler.removeCallbacks(seekCommit)
         handler.removeCallbacks(seekScanTick)
+        handler.removeCallbacks(hideSeekBox)
         if (::playerView.isInitialized) playerView.player = null
         player?.release()
         player = null
