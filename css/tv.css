@@ -81,8 +81,11 @@ img { -webkit-user-drag: none; }
 #viewHome, #viewSearch, #viewDetail { scrollbar-width: none; }
 
 /* ============================ HERO (Billboard) ============================ */
+/* 高度 92vh 里有 14vh 是垫在首排卡片下面的：图片继续向下延伸，底部渐变有足够行程
+   平滑收进页面底色，不会在图和首排之间留一条硬黑边。
+   padding-bottom 与 .tv-rows 的负 margin 同步加了这 14vh，所以文字与首排位置不变 */
 .tv-hero {
-    position: relative; height: 78vh; padding: 0 4.5vw 8vh;
+    position: relative; height: 92vh; padding: 0 4.5vw 22vh;
     display: flex; flex-direction: column; justify-content: flex-end; overflow: hidden;
 }
 /* 氛围底层：轻度虚化铺满，保证左侧文字区不发黑 */
@@ -101,11 +104,13 @@ img { -webkit-user-drag: none; }
     mask-image: linear-gradient(to right, transparent 0, #000 32%);
     transition: background-image 0.6s var(--ease);
 }
-/* Netflix 标志性双重渐变：底部融入页面 + 左侧文字保护 */
+/* Netflix 标志性双重渐变：底部融入页面 + 左侧文字保护。
+   底部这条的行程刻意拉长：纯底色只出现在最后 8%（已被首排卡片盖住），
+   首排开始的位置（距底 ~17vh）压到 0.72 —— 图还透得出来，又够首排标题的对比度 */
 .tv-hero::after {
     content: ""; position: absolute; inset: 0; z-index: 0;
     background:
-        linear-gradient(to top, var(--bg) 6%, rgba(20,20,20,0.25) 42%, transparent 72%),
+        linear-gradient(to top, var(--bg) 8%, rgba(20,20,20,0.72) 20%, rgba(20,20,20,0.3) 34%, transparent 58%),
         linear-gradient(to right, rgba(20,20,20,0.9) 0%, rgba(20,20,20,0.4) 40%, transparent 65%);
 }
 /* 注意 :not() 排除背景层，避免把它们从 absolute 覆盖成 relative 导致高度塌陷 */
@@ -133,7 +138,8 @@ img { -webkit-user-drag: none; }
 .tv-btn.primary.focused { background: rgba(255,255,255,0.85); }
 
 /* ============================ 内容排 ROWS ============================ */
-.tv-rows { position: relative; margin-top: -3vh; padding-top: 1vh; overflow: visible; }  /* 首排上浮压住 billboard 底部 */
+/* 首排上浮压住 billboard 底部：-17vh = 原来的 -3vh + hero 多出的 14vh 延伸量 */
+.tv-rows { position: relative; margin-top: -17vh; padding-top: 1vh; overflow: visible; }
 .tv-row { margin-bottom: 1.5vh; overflow: visible; }
 .tv-row-title { font-size: clamp(15px,1.25vw,22px); font-weight: 700; margin: 0 0 0.6vh 4.5vw; color: #e5e5e5; }
 .tv-row-track { display: flex; gap: 0.5vw; padding: 1.5vh 4.5vw; transition: transform 0.4s var(--ease); will-change: transform; }
