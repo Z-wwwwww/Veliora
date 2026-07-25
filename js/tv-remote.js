@@ -129,27 +129,33 @@
     let current = null;
     let overlayEl = null;   // 弹层（密码/输入/选项）打开时，焦点限制在弹层内
 
-    function focusables() {
-        if (overlayEl) {
-            return [...overlayEl.querySelectorAll('.focusable')].filter(el =>
-                el.offsetParent !== null && el.getBoundingClientRect().width > 0);
-        }
-        const root = document.querySelector('.tv-view.active') || document;
-        const nav = document.getElementById('topbar');
+    // offsetParent 与 getBoundingClientRect 都会触发强制布局，首页有 70+ 张卡时一遍就要几毫秒。
+    // 这里一次遍历同时拿到可见性与位置，几何导航直接复用这批 rect，避免同一次按键读两遍。
+    function focusableRects() {
+        const root = overlayEl || document.querySelector('.tv-view.active') || document;
         const list = [...root.querySelectorAll('.focusable')];
-        // 顶部导航常驻可达
-        if (nav) list.unshift(...nav.querySelectorAll('.focusable'));
-        return list.filter(el => el.offsetParent !== null &&
-            el.getBoundingClientRect().width > 0);
+        if (!overlayEl) {
+            const nav = document.getElementById('topbar');   // 顶部导航常驻可达
+            if (nav) list.unshift(...nav.querySelectorAll('.focusable'));
+        }
+        const out = [];
+        for (const el of list) {
+            if (el.offsetParent === null) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0) out.push({ el, rect });
+        }
+        return out;
     }
 
+    function focusables() { return focusableRects().map(i => i.el); }
+
     let heroFollowTimer = null;
-    function setFocus(el, scroll = true) {
+    function setFocus(el, scroll = true, rect = null) {
         if (!el) return;
         if (current) current.classList.remove('focused');
         current = el;
         el.classList.add('focused');
-        if (scroll) ensureVisible(el);
+        if (scroll) ensureVisible(el, rect);
 
         // Netflix TV 行为：首页焦点停留 0.4s 后，Billboard 切换为当前聚焦影片
         if (state.view === 'home' && el._doubanItem) {
@@ -167,22 +173,21 @@
         }
     }
 
-    function ensureVisible(el) {
+    // rect 可由调用方传入（几何导航已经读过一遍），省一次强制布局
+    function ensureVisible(el, rect = null) {
         // 筛选浮层内的元素固定定位，无需滚动（滚动反而会拖动底下的网格）
         if (el.closest('#discFilters.overlay')) return;
         // 横向：所在 row 手动 translateX 使卡片居中偏左
         const track = el.closest('.tv-row-track');
+        const vr = rect || el.getBoundingClientRect();   // 本次唯一必须现读的几何量
         if (track) {
-            const row = track.parentElement;
-            const cRect = el.getBoundingClientRect();
-            const rRect = row.getBoundingClientRect();
+            const m = trackMetrics(track);
             const pad = window.innerWidth * 0.04;
-            let dx = (cRect.left - rRect.left) - pad;
             const cur = parseFloat(track.dataset.tx || '0');
-            let tx = cur - dx;
-            const maxTx = 0;
-            const minTx = Math.min(0, row.clientWidth - track.scrollWidth - pad);
-            tx = Math.max(minTx, Math.min(maxTx, tx));
+            // 卡片当前视口位置减去排的固定左边界，得到它在排内的偏移
+            let tx = cur - ((vr.left - m.left) - pad);
+            const minTx = Math.min(0, m.rowW - m.scrollW - pad);
+            tx = Math.max(minTx, Math.min(0, tx));
             track.dataset.tx = tx;
             track.style.transform = `translateX(${tx}px)`;
         }
@@ -192,30 +197,89 @@
         const rowsEl = document.getElementById('rows');
         if (rowEl && rowsEl && rowEl === rowsEl.firstElementChild) {
             const home = document.getElementById('viewHome');
-            if (home) home.scrollTo({ top: 0, behavior: 'smooth' });
+            if (home && home.scrollTop > 0) home.scrollTo({ top: 0, behavior: 'smooth' });
             return;
         }
+        // 已经舒服地在视区里就别滚：同排左右移动占按键的绝大多数，scrollIntoView
+        // 每次都要再算一遍布局并起一段平滑滚动动画，和排内 translateX 过渡打架
+        const margin = window.innerHeight * 0.12;
+        if (vr.top >= margin && vr.bottom <= window.innerHeight - margin) return;
         el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+    }
+
+    // 排的左边界、可视宽、内容总宽在这一排建好之后就不再变，但 scrollWidth / clientWidth /
+    // getBoundingClientRect 每次读都会触发一次整排（十几张卡）的强制布局。
+    // 缓存在元素上，只在窗口尺寸变化时作废 —— 这是按键路径上最后一处强制回流。
+    let metricsEpoch = 0;
+    window.addEventListener('resize', () => { metricsEpoch++; });
+    function trackMetrics(track) {
+        if (track._metrics && track._metricsEpoch === metricsEpoch &&
+            track._metricsCount === track.children.length) {
+            return track._metrics;
+        }
+        const row = track.parentElement;
+        track._metrics = {
+            left: row.getBoundingClientRect().left,
+            rowW: row.clientWidth,
+            scrollW: track.scrollWidth,
+        };
+        track._metricsEpoch = metricsEpoch;
+        track._metricsCount = track.children.length;
+        return track._metrics;
     }
 
     function center(rect) { return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }; }
 
+    // 横排的结构是已知的：同排左右就是相邻兄弟，跨排只需看目标排。走这条快路可以免掉
+    // 「读 70+ 个元素 rect」的全量强制布局 —— 首页的按键绝大多数都命中这里。
+    // 排头/排尾、非横排布局（发现页网格、设置页等）返回 false，交回几何导航兜底。
+    function fastNavigate(dir) {
+        if (overlayEl || !current) return false;
+        const track = current.parentElement;
+        if (!track || !track.classList.contains('tv-row-track')) return false;
+
+        if (dir === 'left' || dir === 'right') {
+            const sib = dir === 'left' ? current.previousElementSibling : current.nextElementSibling;
+            if (!sib || !sib.classList.contains('focusable')) return false;
+            // rect 在这里读一次并传下去，ensureVisible 就不必再读
+            setFocus(sib, true, sib.getBoundingClientRect());
+            return true;
+        }
+        const rows = [...document.querySelectorAll('#rows .tv-row')];
+        const i = rows.indexOf(track.parentElement);
+        const target = rows[dir === 'up' ? i - 1 : i + 1];
+        if (i < 0 || !target) return false;
+        const tiles = [...target.querySelectorAll('.focusable')];
+        if (!tiles.length) return false;
+        // 只读目标排这十几个 rect，按横向位置就近对齐
+        const cx = current.getBoundingClientRect().left;
+        let best = tiles[0], bestD = Infinity, bestRect = null;
+        for (const t of tiles) {
+            const r = t.getBoundingClientRect();
+            const d = Math.abs(r.left - cx);
+            if (d < bestD) { bestD = d; best = t; bestRect = r; }
+        }
+        setFocus(best, true, bestRect);
+        return true;
+    }
+
     function navigate(dir) {
         // 焦点所在节点被重渲染移除时（如药丸区刷新），其 rect 全为 0，会把方向判断带偏
         if (current && (!current.isConnected || current.offsetParent === null)) current = null;
-        const items = focusables();
+        if (fastNavigate(dir)) return;
+
+        const items = focusableRects();
         if (!current) {
             const root = document.querySelector('.tv-view.active');
-            setFocus((root && root.querySelector('.focusable')) || items[0]);
+            setFocus((root && root.querySelector('.focusable')) || (items[0] && items[0].el));
             return;
         }
         const from = current.getBoundingClientRect();
         const fc = center(from);
-        let best = null, bestScore = Infinity;
+        let best = null, bestScore = Infinity, bestRect = null;
 
-        for (const el of items) {
+        for (const { el, rect: r } of items) {
             if (el === current) continue;
-            const r = el.getBoundingClientRect();
             const c = center(r);
             const dx = c.x - fc.x, dy = c.y - fc.y;
             // 方向过滤
@@ -228,9 +292,9 @@
             if (dir === 'left' || dir === 'right') { primary = Math.abs(dx); cross = Math.abs(dy); }
             else { primary = Math.abs(dy); cross = Math.abs(dx); }
             const score = primary + cross * 2.5;
-            if (score < bestScore) { bestScore = score; best = el; }
+            if (score < bestScore) { bestScore = score; best = el; bestRect = r; }
         }
-        if (best) setFocus(best);
+        if (best) setFocus(best, true, bestRect);
     }
 
     // ============================================================
@@ -380,13 +444,13 @@
 
     function setHero(item) {
         const bg = document.getElementById('heroBg');
-        // 小图铺满 Billboard 会糊，升级为大图
+        // 右侧清晰主图层要大图（小图铺满 Billboard 会糊）
         const cover = hdCover(item.cover);
-        const url = cover ? `url("${proxyImg(cover)}")` : '';
-        bg.style.backgroundImage = url;
-        // 右侧清晰主图层（与氛围层同一张图，只加载一次）
         const sharp = document.getElementById('heroBgSharp');
-        if (sharp) sharp.style.backgroundImage = url;
+        if (sharp) sharp.style.backgroundImage = cover ? `url("${proxyImg(cover)}")` : '';
+        // 底层氛围图是 blur(18px) 糊掉的，用原图（豆瓣小图）就够：省掉一张大图的
+        // 下载与解码，电视上焦点每停一次都要换这张图，差别很明显
+        bg.style.backgroundImage = item.cover ? `url("${proxyImg(item.cover)}")` : '';
         document.getElementById('heroTitle').textContent = item.title || 'Veliora';
         document.getElementById('heroMeta').innerHTML =
             (item.rate ? `<span class="rate">★ ${item.rate}</span>` : '') +
