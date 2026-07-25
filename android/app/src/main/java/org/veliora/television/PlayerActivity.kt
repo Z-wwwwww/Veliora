@@ -39,7 +39,8 @@ import androidx.media3.ui.PlayerView
  * HLS 由 Media3 原生解析，MediaCodec 硬解直通，4K/HEVC 能力取决于芯片而非 WebView。
  *
  * 遥控器约定（控制条隐藏时）：
- * - 左/右：快退/快进 15 秒；OK：暂停/继续并唤出控制条
+ * - 左/右：按一下快退/快进 15 秒（连按累加）；按住转为连续扫描，倍速 8x→16x→32x→64x 递增，
+ *   松手才落点。OK：暂停/继续并唤出控制条
  * - 上/下：唤出控制条（内含上一集/下一集/进度条，方向键导航）
  * - 菜单键 / 长按 OK：清晰度选择（仅多码率源），手动锁档并记忆偏好
  * - 返回：控制条可见则先收起，否则退出回到选片页
@@ -56,9 +57,18 @@ class PlayerActivity : Activity() {
         const val RESULT_FALLBACK = 9             // 原生播放失败 → MainActivity 回退 WebView 播放器
 
         private const val PREFS = "playbackProgress"
-        private const val SEEK_STEP_MS = 15_000L
         private const val MIN_RESUME_MS = 10_000L   // 进度小于此值不续播
         private const val NEAR_END_MS = 30_000L     // 距结尾小于此值视为已看完
+
+        // ---------- 快进/快退节奏（对齐 Apple TV / Android TV 主流播放器）----------
+        // 短按一次跳 15 秒；连按累加成一次 seek；按住转为连续扫描，倍速随时长递增。
+        private const val SEEK_STEP_MS = 15_000L
+        private const val SEEK_LONG_PRESS_MS = 500L    // 按住超过此时长转入连续扫描
+        private const val SEEK_TICK_MS = 100L          // 扫描节拍
+        private const val SEEK_COMMIT_DELAY_MS = 250L  // 连按合并窗口：停手这么久才真正 seek
+        // 扫描硬上限：纯兜底（个别遥控器只发 DOWN 不发 UP）。
+        // 取 30s 是因为 64x 下按住 30 秒≈跳 29 分钟，正常人不会按这么久，卡住也不至于直接冲到片尾
+        private const val SEEK_SCAN_MAX_MS = 30_000L
 
         // 清晰度偏好（按分辨率高度记忆，0=自动；下划线前缀避免与进度存储的 URL 键冲突）
         private const val KEY_QUALITY = "__preferredQuality"
@@ -106,6 +116,30 @@ class PlayerActivity : Activity() {
     private var currentVideoHeight = 0    // 实际在播的分辨率高度（用于浮层显示）
     private var okLongPressFired = false
     private val okLongPress = Runnable { okLongPressFired = true; openQualityDialog() }
+
+    // ---------- 快进/快退状态 ----------
+    // seekTargetMs >= 0 表示正在攒一次 seek：期间只更新目标点与浮层，不真的 seek。
+    // 每次按键都立刻 seek 的话，HLS 会被反复冲缓冲区（原实现连系统自动重复也照单全收，
+    // 按住一秒就是十几次 seek，画面卡死且位置乱跳）。
+    private var seekTargetMs = -1L
+    private var seekDirection = 0        // +1 快进 / -1 快退
+    private var seekScanStartMs = 0L     // 进入连续扫描的时刻，0 = 尚未进入
+
+    private val seekLongPress = Runnable { startSeekScan() }
+    private val seekCommit = Runnable { commitSeek() }
+    private val seekScanTick = object : Runnable {
+        override fun run() {
+            // 控制条被唤出时方向键归控制条；扫描超上限也收尾，避免停不下来
+            val held = android.os.SystemClock.elapsedRealtime() - seekScanStartMs
+            if (seekTargetMs < 0 || playerView.isControllerFullyVisible || held > SEEK_SCAN_MAX_MS) {
+                commitSeek()
+                return
+            }
+            val rate = seekScanRate()
+            advanceSeek(seekDirection * rate * SEEK_TICK_MS)
+            handler.postDelayed(this, SEEK_TICK_MS)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -285,6 +319,102 @@ class PlayerActivity : Activity() {
         else -> "$bytesPerSec B/s"
     }
 
+    // ---------- 快进/快退 ----------
+    // 主流电视播放器（Apple TV、Android TV、Netflix）的一致做法：
+    //   1) 按一下 = 定量跳一步（10~15 秒），不是「按住才动」
+    //   2) 连按 = 累加成一次 seek，界面立刻显示目标点，手停下来才真的跳
+    //   3) 按住 = 连续扫描，倍速随按住时长递增，松手落点
+    // 我们把系统的自动重复（repeatCount>0）全部丢掉，扫描完全由自己的节拍驱动，
+    // 这样速度不受各家遥控器重复率影响，且整个长按只产生一次 seek。
+
+    private fun seekScanRate(): Int {
+        val held = android.os.SystemClock.elapsedRealtime() - seekScanStartMs
+        return when {
+            seekScanStartMs == 0L -> 0
+            held < 1_500 -> 8
+            held < 3_000 -> 16
+            held < 5_000 -> 32
+            else -> 64
+        }
+    }
+
+    private fun onSeekKeyDown(direction: Int) {
+        val exo = player ?: return
+        if (seekTargetMs < 0) seekTargetMs = exo.currentPosition
+        seekDirection = direction
+        handler.removeCallbacks(seekCommit)
+        // 按下即给一步反馈；若继续按住，SEEK_LONG_PRESS_MS 后由扫描接管
+        advanceSeek(direction * SEEK_STEP_MS)
+        handler.postDelayed(seekLongPress, SEEK_LONG_PRESS_MS)
+    }
+
+    private fun onSeekKeyUp() {
+        handler.removeCallbacks(seekLongPress)
+        stopSeekScan()
+        handler.removeCallbacks(seekCommit)
+        handler.postDelayed(seekCommit, SEEK_COMMIT_DELAY_MS)
+    }
+
+    private fun startSeekScan() {
+        if (seekTargetMs < 0) return
+        seekScanStartMs = android.os.SystemClock.elapsedRealtime()
+        handler.removeCallbacks(seekScanTick)
+        handler.post(seekScanTick)
+    }
+
+    private fun stopSeekScan() {
+        handler.removeCallbacks(seekScanTick)
+        seekScanStartMs = 0L
+    }
+
+    private fun advanceSeek(deltaMs: Long) {
+        val exo = player ?: return
+        val dur = exo.duration
+        var target = seekTargetMs + deltaMs
+        if (target < 0) target = 0
+        // 留 1 秒余量：正好落在结尾会直接触发切集
+        if (dur > 0 && target > dur - 1_000) target = (dur - 1_000).coerceAtLeast(0)
+        seekTargetMs = target
+        showSeekOverlay()
+    }
+
+    private fun commitSeek() {
+        stopSeekScan()
+        handler.removeCallbacks(seekCommit)
+        val exo = player
+        val target = seekTargetMs
+        seekTargetMs = -1L
+        if (exo == null || target < 0) return
+        exo.seekTo(target)
+        handler.removeCallbacks(hideOverlay)
+        handler.postDelayed(hideOverlay, 1200)
+    }
+
+    private fun showSeekOverlay() {
+        val exo = player ?: return
+        val dur = exo.duration
+        val delta = seekTargetMs - exo.currentPosition
+        val arrow = if (seekDirection >= 0) "▶▶" else "◀◀"
+        val sign = if (delta >= 0) "+" else "-"
+        val rate = seekScanRate()
+        overlay.text = buildString {
+            append(arrow).append(' ').append(formatTime(seekTargetMs))
+            if (dur > 0) append(" / ").append(formatTime(dur))
+            append("   ").append(sign).append(Math.abs(delta) / 1000).append(" 秒")
+            if (rate > 0) append("   ").append(rate).append("x")
+        }
+        overlay.visibility = View.VISIBLE
+        handler.removeCallbacks(hideOverlay)
+    }
+
+    private fun formatTime(ms: Long): String {
+        val total = (ms.coerceAtLeast(0) + 500) / 1000
+        val h = total / 3600
+        val m = (total % 3600) / 60
+        val s = total % 60
+        return if (h > 0) String.format("%d:%02d:%02d", h, m, s) else String.format("%02d:%02d", m, s)
+    }
+
     private fun showOverlayHint() {
         val exo = player ?: return
         val idx = exo.currentMediaItemIndex
@@ -423,6 +553,24 @@ class PlayerActivity : Activity() {
             return true
         }
 
+        // 快进/快退键要同时吃 DOWN 与 UP（短按累加、长按扫描、松手落点），
+        // 所以放在下面 ACTION_DOWN 早退之前。方向键仅在控制条隐藏时接管，媒体键始终接管。
+        val seekDir = when (event.keyCode) {
+            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> 1
+            KeyEvent.KEYCODE_MEDIA_REWIND -> -1
+            KeyEvent.KEYCODE_DPAD_RIGHT -> if (playerView.isControllerFullyVisible) 0 else 1
+            KeyEvent.KEYCODE_DPAD_LEFT -> if (playerView.isControllerFullyVisible) 0 else -1
+            else -> 0
+        }
+        if (seekDir != 0) {
+            when (event.action) {
+                // repeatCount > 0 是系统自动重复，一律丢弃：扫描由 seekScanTick 自己定速
+                KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0) onSeekKeyDown(seekDir)
+                KeyEvent.ACTION_UP -> onSeekKeyUp()
+            }
+            return true
+        }
+
         if (event.action != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
 
         when (event.keyCode) {
@@ -453,31 +601,11 @@ class PlayerActivity : Activity() {
                 if (exo.hasPreviousMediaItem()) exo.seekToPreviousMediaItem()
                 return true
             }
-            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
-                val target = exo.currentPosition + SEEK_STEP_MS
-                exo.seekTo(if (exo.duration > 0) target.coerceAtMost(exo.duration) else target)
-                return true
-            }
-            KeyEvent.KEYCODE_MEDIA_REWIND -> {
-                exo.seekTo((exo.currentPosition - SEEK_STEP_MS).coerceAtLeast(0))
-                return true
-            }
         }
 
-        // 控制条隐藏时的方向键快捷操作；可见时交给控制条自身导航
+        // 控制条隐藏时上/下唤出控制条；可见时交给控制条自身导航
         if (!playerView.isControllerFullyVisible) {
             when (event.keyCode) {
-                KeyEvent.KEYCODE_DPAD_LEFT -> {
-                    exo.seekTo((exo.currentPosition - SEEK_STEP_MS).coerceAtLeast(0))
-                    showOverlayHint()
-                    return true
-                }
-                KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                    val target = exo.currentPosition + SEEK_STEP_MS
-                    exo.seekTo(if (exo.duration > 0) target.coerceAtMost(exo.duration) else target)
-                    showOverlayHint()
-                    return true
-                }
                 KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
                     playerView.showController()
                     return true
@@ -491,6 +619,7 @@ class PlayerActivity : Activity() {
 
     override fun onPause() {
         super.onPause()
+        commitSeek()      // 攒着没提交的快进要先落点，否则存的是旧进度
         saveProgress()
         player?.pause()
     }
@@ -499,6 +628,9 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(hideOverlay)
         handler.removeCallbacks(okLongPress)
         handler.removeCallbacks(speedTicker)
+        handler.removeCallbacks(seekLongPress)
+        handler.removeCallbacks(seekCommit)
+        handler.removeCallbacks(seekScanTick)
         if (::playerView.isInitialized) playerView.player = null
         player?.release()
         player = null
