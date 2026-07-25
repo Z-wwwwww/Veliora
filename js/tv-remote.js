@@ -58,8 +58,21 @@
         set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
     };
 
+    // 若某个源的站点关掉了搜索接口（`ac=videolist&wd=` 不回 JSON），把它的 key 填进这里，
+    // 会从默认值与已选列表中剔除，避免每次搜索都白等一次超时；源本身保留，仍可手动勾选。
+    const SEARCH_DEAD_SOURCES = [];
+
     // 首次使用初始化默认值（与上游 app.js 行为一致）
     function initDefaults() {
+        // 剔除已知搜索失效的源，已装机用户清一次（只做一次，不动其他选择）
+        if (!localStorage.getItem('deadSourcesCleaned_v1')) {
+            const sel = store.get('selectedAPIs', null);
+            if (Array.isArray(sel) && SEARCH_DEAD_SOURCES.length) {
+                const kept = sel.filter(k => !SEARCH_DEAD_SOURCES.includes(k));
+                if (kept.length && kept.length !== sel.length) store.set('selectedAPIs', kept);
+            }
+            localStorage.setItem('deadSourcesCleaned_v1', '1');
+        }
         if (localStorage.getItem('hasInitializedDefaults')) return;
         store.set('selectedAPIs', []);   // 默认无内置源，用户在「设置」中自行添加
         localStorage.setItem('yellowFilterEnabled', 'true');
@@ -188,8 +201,14 @@
     function center(rect) { return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }; }
 
     function navigate(dir) {
-        if (!current) { setFocus(focusables()[0]); return; }
+        // 焦点所在节点被重渲染移除时（如药丸区刷新），其 rect 全为 0，会把方向判断带偏
+        if (current && (!current.isConnected || current.offsetParent === null)) current = null;
         const items = focusables();
+        if (!current) {
+            const root = document.querySelector('.tv-view.active');
+            setFocus((root && root.querySelector('.focusable')) || items[0]);
+            return;
+        }
         const from = current.getBoundingClientRect();
         const fc = center(from);
         let best = null, bestScore = Infinity;
@@ -535,55 +554,287 @@
         scheduleSuggest();
     }
 
-    // ---------- 拼音联想（豆瓣 subject_suggest）----------
-    // 软键盘只有字母数字，用户实际输入的是拼音/首字母；直接拿它去采集源搜索
-    // 匹配又宽又乱。这里把输入联想成中文片名候选，点候选词按精确片名搜索。
+    // ---------- 拼音联想：字母输入 → 中文片名候选 ----------
+    // 软键盘只有字母数字，用户实际输入的是全拼（qingyunian）或首字母（qyn）。
+    // 采集源是 MacCMS，wd= 只按 vod_name（中文名）做 LIKE 匹配，vod_en(拼音)/vod_sub(别名)
+    // 都不参与匹配 —— 实测 wd=qingyunian / QYN / joyoflife 一律 total=0。
+    // 所以字母输入必须先联想成中文片名，再拿中文去搜；三路联想互补：
+    //   爱奇艺 suggest —— 影视垂直，支持全拼 + 首字母（qyn → 庆余年），结果最干净
+    //   百度 suggestion —— 拼音/首字母覆盖最好，但混着网页搜索词（"庆余年演员表"），要清洗
+    //   豆瓣 subject_suggest —— 只认中文名/英文原名（拼音一律返回 []），但英文片名靠它
+    // 候选词既渲染成「猜你想搜」药丸，也在按「搜索」时自动参与搜索（见 buildSearchQueries）。
+
+    const VIDEO_TAGS = ['电视剧', '电影', '动漫', '动画', '综艺', '纪录片', '少儿', '短剧', '漫剧', '微剧', '系列'];
+    const PERSON_TAGS = ['人物', '明星', '演员', '导演'];
+    // 联想词尾部噪音：'庆余年演员表'→庆余年、'甄嬛传76集全'→甄嬛传、'三体电视剧'→三体
+    const NOISE_TAIL = /(在线观看|免费观看|免费在线|完整版|未删减|高清版|高清|全集|全剧|电视剧|电影版|电影|动漫|动画片|演员表|演员|分集剧情|剧情介绍|剧情|大结局|结局|解说|下载|百度百科|百科|小说原著|小说|原著|漫画|歌曲|图片|壁纸|资源|网盘|迅雷|免费|观看|上映时间|上映|什么时候|好看吗|评价|豆瓣|一共多少集|多少集|多少季|第[0-9一二三四五六七八九十]+集|[0-9]+集全|全[0-9]+集|爱奇艺|腾讯视频|优酷|芒果TV|哔哩哔哩|樱花动漫)$/;
+    const SEASON_TAIL = /\s*第[0-9一二三四五六七八九十百]+[季部]$/;
+    // 整条就是网页搜索词的（「breakingbad翻译成中文」「甄嬛传哪一年播出的」），直接不作为候选
+    const NOISE_ANY = /(什么意思|怎么读|怎么写|翻译成|音标|原曲|简谱|歌词|哪一年|哪个平台|在哪看|在哪播|多少集|多少季|好看吗|值得看|排行|排名|百度|知乎|贴吧|网盘|迅雷|资源|演员表|分集|剧情介绍|大结局|解说|花絮|片尾曲|主题曲|上映时间|取景地|拍摄地|原著小说)/;
+
+    const hasCJK = s => /[一-龥]/.test(s || '');
+
+    function cleanSuggestTitle(s) {
+        let t = String(s == null ? '' : s).replace(/[《》【】"'“”‘’]/g, '').trim();
+        for (let i = 0; i < 4; i++) {
+            const n = t.replace(NOISE_TAIL, '').trim();
+            if (!n || n === t) break;
+            t = n;
+        }
+        return t;
+    }
+
+    // 走后端代理取文本（联想接口都不带 CORS 头，且 App 内需带鉴权参数）
+    async function fetchProxyText(url, timeout = 6000) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
+        try {
+            const base = PROXY + encodeURIComponent(url);
+            const target = window.ProxyAuth && window.ProxyAuth.addAuthToProxyUrl
+                ? await window.ProxyAuth.addAuthToProxyUrl(base) : base;
+            const res = await fetch(target, { signal: controller.signal });
+            if (!res.ok) return '';
+            return await res.text();
+        } catch (e) {
+            return '';
+        } finally { clearTimeout(timer); }
+    }
+
+    // 各引擎统一返回 [{ title, weight }]，weight 越小越可信（0=确定是影视条目）
+    async function suggestFromIqiyi(q) {
+        const txt = await fetchProxyText(
+            'https://suggest.video.iqiyi.com/?if=mobile&key=' + encodeURIComponent(q));
+        let data;
+        try { data = JSON.parse(txt); } catch (e) { return []; }
+        const out = [];
+        ((data && data.data) || []).forEach(it => {
+            const pe = it.presentation_element || {};
+            const tags = (pe.tags || []).map(t => t.name || '');
+            if (tags.some(t => PERSON_TAGS.includes(t))) return;          // 影人条目搜不出片子
+            const isVideo = tags.some(t => VIDEO_TAGS.includes(t)) || VIDEO_TAGS.includes(it.cname || '');
+            const name = it.name || '';
+            out.push({ title: cleanSuggestTitle(name), weight: isVideo ? 0 : 2 });
+            // 英文原名条目的 show_reason 就是中文译名（Interstellar→星际穿越、Friends→老友记第一季），
+            // 采集源只认中文名，这条才是能搜出结果的关键词
+            const zh = pe.show_reason || '';
+            if (!hasCJK(name) && hasCJK(zh) && zh.length <= 20 && !/[\/、《]/.test(zh)) {
+                out.push({ title: cleanSuggestTitle(zh), weight: isVideo ? 0 : 2 });
+            }
+        });
+        return out;
+    }
+
+    async function suggestFromBaidu(q) {
+        // json=1 返回 JSONP：window.baidu.sug({"q":..,"g":[{"q":"庆余年"},..]})
+        const txt = await fetchProxyText(
+            'https://suggestion.baidu.com/su?ie=utf-8&json=1&p=3&wd=' + encodeURIComponent(q));
+        const m = txt.match(/\{[\s\S]*\}/);
+        if (!m) return [];
+        let data;
+        try { data = JSON.parse(m[0]); } catch (e) { return []; }
+        const raw = Array.isArray(data.g) ? data.g.map(i => (i && i.q) || i)
+                  : Array.isArray(data.s) ? data.s : [];
+        return raw.map(s => ({ title: cleanSuggestTitle(s), weight: 1 }));
+    }
+
+    // 不走 fetchDoubanData：它超时 10s 且失败后还会去试早已失效的 allorigins 兜底，
+    // 联想是三路并发等齐的，豆瓣一慢就把整次搜索拖住（实测能多等 10s 以上）
+    async function suggestFromDouban(q) {
+        const txt = await fetchProxyText(
+            'https://movie.douban.com/j/subject_suggest?q=' + encodeURIComponent(q), 4000);
+        let data;
+        try { data = JSON.parse(txt); } catch (e) { return []; }
+        return (Array.isArray(data) ? data : [])
+            .filter(it => !(it.url || '').includes('/celebrity/'))        // 跳过影人条目
+            .map(it => ({ title: cleanSuggestTitle(it.title), weight: 0 }));
+    }
+
+    // 输入 → 中文片名候选（按可信度排序）。同一输入只请求一次，逐字输入时前缀命中缓存
+    const suggestCache = new Map();
+    function resolveTitles(input) {
+        const q = (input || '').trim();
+        if (!q) return Promise.resolve([]);
+        const key = q.toLowerCase();
+        if (suggestCache.has(key)) return suggestCache.get(key);
+
+        const ascii = !hasCJK(q);
+        // 引擎顺序即同权重下的排序优先级。豆瓣放第一：它认英文原名且直接给中文译名
+        // （friends → 老友记 第一季），正是采集源要的关键词
+        const engines = ascii
+            ? [suggestFromDouban(key), suggestFromIqiyi(key), suggestFromBaidu(key)]
+            : [suggestFromDouban(q), suggestFromIqiyi(q)];
+
+        const job = Promise.all(engines.map(p => Promise.resolve(p).catch(() => [])))
+            .then(lists => {
+                const scored = new Map();
+                lists.forEach((list, engineIdx) => {
+                    list.forEach((item, i) => {
+                        const t = item.title;
+                        if (!t || t.length < 2 || t.length > 24) return;
+                        if (NOISE_ANY.test(t)) return;
+                        // 字母输入时纯字母候选没意义（源按中文名匹配，原样输入另外会搜一次）
+                        if (ascii && !hasCJK(t)) return;
+                        const score = item.weight * 100 + engineIdx * 10 + i;
+                        if (!scored.has(t) || scored.get(t) > score) scored.set(t, score);
+                    });
+                });
+                const ordered = [...scored.entries()].sort((a, b) => a[1] - b[1]).map(e => e[0]);
+                return dropWebSearchNoise(withCommonPrefix(ordered)).slice(0, 12);
+            });
+        suggestCache.set(key, job);
+        job.catch(() => suggestCache.delete(key));
+        return job;
+    }
+
+    // 百度联想常给「追风者软件」「追风者瑞金取景地」这类网页搜索词，片名本身反而不在列表里。
+    // 若前几名共享同一中文前缀，就把该前缀本身补成首选候选（→「追风者」）。
+    function withCommonPrefix(titles) {
+        const top = titles.slice(0, 6).filter(hasCJK);
+        if (top.length < 3) return titles;
+        // 取「命中最多」的前缀（同命中数取更长的）：命中越多越像片名本体，
+        // 只取最长会退化成「追风者若来」这种半截搜索词
+        let best = '', bestCount = 0;
+        for (const t of top) {
+            for (let len = 2; len < t.length; len++) {
+                const p = t.slice(0, len);
+                if (!hasCJK(p)) continue;
+                const count = top.filter(x => x.startsWith(p)).length;
+                if (count < 3) continue;
+                if (count > bestCount || (count === bestCount && p.length > best.length)) {
+                    best = p; bestCount = count;
+                }
+            }
+        }
+        best = best.replace(/[第之的与和上下新·\s]+$/, '');   // 「庆余年第」这类断在半个词上的前缀
+        if (best.length < 2 || titles.includes(best)) return titles;
+        return [best, ...titles];
+    }
+
+    // 已有候选 + 非「季/部」后缀 = 网页搜索词（「甄嬛传导演」「庆余年小说原著」），去掉
+    const SEASONISH = /^(第[0-9一二三四五六七八九十百]+[季部]|[0-9]{1,2}|之.{1,10}|续集|外传|前传|后传|年番|动态漫画.*|粤语|国语|特别篇|剧场版|终章|完结篇)$/i;
+    function dropWebSearchNoise(titles) {
+        const kept = [];
+        titles.forEach(t => {
+            const parent = kept.find(k => t !== k && t.startsWith(k));
+            if (parent) {
+                const rest = t.slice(parent.length).replace(/^[\s·:：\-—_]+/, '');
+                if (!SEASONISH.test(rest)) return;
+            }
+            kept.push(t);
+        });
+        return kept;
+    }
+
     let suggestTimer = null, suggestToken = 0;
     function scheduleSuggest() {
         clearTimeout(suggestTimer);
         const box = document.getElementById('searchSuggest');
         if (!box) return;
         const q = state.query.trim();
-        if (!q) { box.innerHTML = ''; suggestToken++; return; }
+        // 单字/单字母联想没意义，且遥控器逐字输入时每个字都要打三个接口，先攒够 2 位再问
+        if (q.length < 2) { box.innerHTML = ''; suggestToken++; return; }
         suggestTimer = setTimeout(async () => {
             const token = ++suggestToken;
             try {
-                const data = await fetchDoubanData(
-                    'https://movie.douban.com/j/subject_suggest?q=' + encodeURIComponent(q));
+                const titles = await resolveTitles(q);
                 if (token !== suggestToken || state.query.trim() !== q) return;   // 输入已变化，丢弃过期联想
-                const titles = [];
-                (Array.isArray(data) ? data : []).forEach(it => {
-                    if ((it.url || '').includes('/celebrity/')) return;   // 跳过影人条目
-                    const t = (it.title || '').trim();
-                    if (t && !titles.includes(t)) titles.push(t);
-                });
-                box.innerHTML = '';
-                if (!titles.length) return;
-                const label = document.createElement('span');
-                label.className = 'chips-label';
-                label.textContent = '猜你想搜：';
-                box.appendChild(label);
-                titles.slice(0, 8).forEach(t => box.appendChild(chipBtn(t, () => {
-                    state.query = t;
-                    renderQuery();
-                    runSearch();
-                })));
+                renderSuggestChips(titles);
             } catch (e) { /* 联想失败静默，不影响直接搜索 */ }
-        }, 400);
+        }, 450);
+    }
+
+    function renderSuggestChips(titles) {
+        const box = document.getElementById('searchSuggest');
+        if (!box) return;
+        box.innerHTML = '';
+        if (!titles || !titles.length) return;
+        const label = document.createElement('span');
+        label.className = 'chips-label';
+        label.textContent = '猜你想搜：';
+        box.appendChild(label);
+        titles.slice(0, 8).forEach(t => box.appendChild(chipBtn(t, () => {
+            state.query = t;
+            renderQuery();
+            runSearch();
+        })));
+    }
+
+    // 字母输入 → 实际搜索关键词。primary 一定要搜，fallback 只在 primary 没结果时再搜，
+    // 免得次级联想（qyn 也会联想出「企业年金」）把无关片子混进结果
+    async function buildSearchQueries(raw) {
+        if (hasCJK(raw)) return { primary: [raw], fallback: [] };
+        let titles = [];
+        try { titles = await resolveTitles(raw); } catch (e) {}
+        const bases = [], fulls = [];
+        titles.filter(hasCJK).forEach(t => {
+            // 去掉「第N季」搜主片名：源里一次能带出全部季，比逐季搜更全
+            const b = t.replace(SEASON_TAIL, '').trim() || t;
+            if (b.length >= 2 && hasCJK(b) && !bases.includes(b)) bases.push(b);
+            if (t !== b && !fulls.includes(t)) fulls.push(t);
+        });
+        const ranked = [...bases, ...fulls];
+        if (!ranked.length) return { primary: [raw], fallback: [] };
+        // 原样输入放 fallback：源里偶尔有「星际穿越 Interstellar」这种片名，但拿 FRIENDS 去搜
+        // 会把上百个含 friend 的无关条目也捞回来，只在中文候选搜空时才用
+        return { primary: ranked.slice(0, 1), fallback: [...ranked.slice(1, 3), raw] };
     }
 
     async function runSearch() {
-        const q = state.query.trim();
-        if (!q) { toast('请输入片名'); return; }
+        const raw = state.query.trim();
+        if (!raw) { toast('请输入片名'); return; }
         if (!ensureVerified()) return;
-        saveSearchHistory(q);
-        showLoading('搜索中…');
+        if (!getSources().length) { toast('没有可用采集源，请到「设置」中选择'); return; }
+        showLoading(hasCJK(raw) ? '搜索中…' : '正在联想片名…');
         try {
-            const list = await searchAll(q);
-            renderSearchResults(list);
+            const { primary, fallback } = await buildSearchQueries(raw);
+            if (!hasCJK(raw)) renderSuggestChips(await resolveTitles(raw));   // 猜错时可直接点别的候选
+
+            let used = primary;
+            let list = await searchQueries(primary);
+            if (!list.length && fallback.length) {     // 首选候选搜空了，再试次级候选
+                used = fallback;
+                list = await searchQueries(fallback);
+            }
+            // 只记真搜到东西的关键词，且记中文片名而不是 QYN 这种字母串，
+            // 否则历史里全是联想歪了的词，点一次还是空
+            if (list.length) saveSearchHistory(used.filter(hasCJK)[0] || raw);
+            renderSearchResults(list, used.filter(hasCJK));
         } catch (e) {
             toast('搜索失败：' + e.message);
         } finally { hideLoading(); }
+    }
+
+    async function searchQueries(queries) {
+        const cn = queries.filter(hasCJK);
+        showLoading(cn.length ? '搜索「' + cn.join('、') + '」…' : '搜索中…');
+        const lists = await Promise.all(queries.map(q => searchAll(q).catch(() => [])));
+        return mergeResults(lists, cn[0] || queries[0]);
+    }
+
+    // 多关键词结果合并去重（同源同 vod_id 视为同一条），按与关键词的贴合度排序：
+    // 源的 wd= 是模糊匹配，会带回一堆沾边条目，纯按片名字典序排会把正主埋在中间
+    function mergeResults(lists, keyword) {
+        const seen = new Set(), all = [];
+        lists.flat().forEach(item => {
+            const k = (item.source_code || '') + '|' + (item.vod_id || item.vod_name || '');
+            if (seen.has(k)) return;
+            seen.add(k);
+            all.push(item);
+        });
+        const kw = (keyword || '').toLowerCase();
+        const rank = item => {
+            const n = (item.vod_name || '').toLowerCase();
+            if (!kw) return 3;
+            if (n === kw) return 0;
+            if (n.startsWith(kw)) return 1;
+            if (n.includes(kw)) return 2;
+            return 3;
+        };
+        all.sort((a, b) =>
+            rank(a) - rank(b) ||
+            (a.vod_name || '').localeCompare(b.vod_name || '') ||
+            (a.source_name || '').localeCompare(b.source_name || ''));
+        return all;
     }
 
     // 黄色内容过滤关键词（与上游 app.js 一致）
@@ -663,12 +914,25 @@
         return el;
     }
 
-    function renderSearchResults(list) {
+    function renderSearchResults(list, guessed) {
         const box = document.getElementById('searchResults');
         box.innerHTML = '';
         if (!list.length) {
-            box.innerHTML = `<div style="grid-column:1/-1;color:var(--text-dim);padding:2vw">未找到「${state.query}」相关结果</div>`;
+            const tip = hasCJK(state.query)
+                ? '换个片名或到「设置」里多选几个采集源试试'
+                : ((guessed && guessed.length)
+                    ? '已试过联想片名：' + esc(guessed.join('、')) + '；可点上方「猜你想搜」选正确的片名'
+                    : '采集源只能按中文片名搜索；请点上方「猜你想搜」里的候选词');
+            box.innerHTML = `<div style="grid-column:1/-1;color:var(--text-dim);padding:2vw;line-height:1.8">`
+                + `未找到「${esc(state.query)}」相关结果<br><span style="font-size:.85em">${tip}</span></div>`;
             return;
+        }
+        // 字母输入时告知实际用的中文关键词，避免用户以为搜的是自己打的字母
+        if (guessed && guessed.length) {
+            const note = document.createElement('div');
+            note.style.cssText = 'grid-column:1/-1;color:var(--text-dim);font-size:.85em;padding:0 0 1vw';
+            note.textContent = '按「' + guessed.join('、') + '」搜索到以下结果';
+            box.appendChild(note);
         }
         // 按片名聚合：一部影片一张卡（与首页豆瓣卡片一致），点进详情后再切换播放源，
         // 避免同一部片在 N 个源里出现 N 张重复卡
@@ -1588,8 +1852,8 @@
                 overlayEl = null;
                 document.dispatchEvent(new CustomEvent('passwordVerified'));
                 const c = document.getElementById('loading');
-                c.classList.add('hidden'); c.innerHTML =
-                    '<div class="tv-spinner"></div><div class="msg" id="loadingMsg">加载中…</div>';
+                c.classList.add('hidden');
+                c.innerHTML = LOADING_HTML;   // 还原 spinner 结构，showLoading 才有 #loadingMsg 可用
                 toast('验证成功');
                 boot();
             } else { this.value = ''; this.render(); toast('密码错误'); }
@@ -1622,12 +1886,24 @@
     // ============================================================
     //  13. 工具：加载 / 提示 / 时钟
     // ============================================================
+    // 注意：#loading 容器被密码门借用过（pwGate.open 会把里面的 spinner 结构整体换成密码键盘），
+    // 验证成功前 #loadingMsg 是不存在的。这里必须容错重建，否则 showLoading 抛 TypeError，
+    // 会把调用它的搜索/发现/详情整条流程静默中断（此前搜索点了没反应就是这个原因）。
+    const LOADING_HTML = '<div class="tv-spinner"></div><div class="msg" id="loadingMsg">加载中…</div>';
     function showLoading(msg) {
+        if (pwGate.active) return;                 // 密码门正开着，别把它盖掉
         const c = document.getElementById('loading');
-        document.getElementById('loadingMsg').textContent = msg || '加载中…';
+        if (!c) return;
+        let m = document.getElementById('loadingMsg');
+        if (!m) { c.innerHTML = LOADING_HTML; m = document.getElementById('loadingMsg'); }
+        if (m) m.textContent = msg || '加载中…';
         c.classList.remove('hidden');
     }
-    function hideLoading() { document.getElementById('loading').classList.add('hidden'); }
+    function hideLoading() {
+        if (pwGate.active) return;
+        const c = document.getElementById('loading');
+        if (c) c.classList.add('hidden');
+    }
 
     let toastTimer;
     function toast(msg) {

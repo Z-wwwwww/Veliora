@@ -210,6 +210,11 @@ app.get('/proxy/:encodedUrl', async (req, res) => {
     ).split(',');
     
     sensitiveHeaders.forEach(header => delete headers[header]);
+    // axios 已把 gzip 响应解压，若把上游的 content-encoding/content-length 原样转发，
+    // 浏览器按压缩后的长度收流会报 ERR_CONTENT_LENGTH_MISMATCH，采集源搜索就会随机失败。
+    // 传输层头一律由本进程重新决定（与 android ProxyHandler.kt 的 FILTERED_HEADERS 一致）
+    ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+      .forEach(header => delete headers[header]);
     res.set(headers);
 
     // 管道传输响应流
