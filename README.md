@@ -14,6 +14,24 @@
 
 **本项目基于 [LibreSpark/LibreTV](https://github.com/LibreSpark/LibreTV) 开发**（Apache License 2.0），复用其多源聚合搜索、苹果 CMS API 适配、豆瓣推荐等核心能力，在此之上进行了电视端的整体改造。感谢原项目及其上游 [bestK/tv](https://github.com/bestK/tv) 的所有贡献者。
 
+## 🖼 界面预览
+
+**首页** —— Netflix 风格 Billboard 随焦点切换，下方横向内容排
+
+![首页](image/screenshots/home.jpg)
+
+**详情页** —— 同一部影片聚合多个播放源，切源后重新载入选集
+
+![详情页](image/screenshots/detail.jpg)
+
+**观看历史** —— 按集记忆播放进度，卡片底部为进度条
+
+![观看历史](image/screenshots/history.jpg)
+
+> 截图仅用于展示界面，未接入任何采集源：片单、评分、集数、观看历史均为演示数据，
+> 影片素材为 Blender 基金会开源电影（CC BY 3.0 / 4.0，逐张署名见
+> [`image/screenshots/CREDITS.md`](image/screenshots/CREDITS.md)）。
+
 ## ✨ 相比上游（LibreTV）的改造
 
 ### 📺 电视端整体改造
@@ -114,6 +132,7 @@ scripts\stop.bat
 ├── css/tv.css               # 电视版样式
 ├── index.html / player.html # 页面（同时用于 Web 与 APK assets）
 ├── js/ libs/ image/         # 上游核心逻辑（聚合搜索/播放/豆瓣/代理鉴权）
+├── image/screenshots/       # README 界面截图（见 CREDITS.md 素材署名）
 ├── scripts/                 # 一键脚本：start/stop/build-apk/install-tv
 └── server.mjs               # 本地/公网部署用 Node 服务（含代理端点）
 ```
