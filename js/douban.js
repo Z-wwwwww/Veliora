@@ -446,12 +446,12 @@ async function fetchDoubanData(url) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
     
-    // 设置请求选项，包括信号和头部
+    // 注意：请求打的是本站 /proxy/，真正连豆瓣的那一跳在代理侧（UA 伪装、
+    // 图床防盗链 Referer 都由 server.mjs / ProxyHandler.kt 负责），这里无需伪装。
+    // 且 fetch 的 User-Agent / Referer 属于 forbidden header，浏览器会直接丢弃。
     const fetchOptions = {
         signal: controller.signal,
         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            'Referer': 'https://movie.douban.com/',
             'Accept': 'application/json, text/plain, */*',
         }
     };

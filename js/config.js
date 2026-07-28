@@ -58,8 +58,9 @@ const API_CONFIG = {
         // 最大获取页数。每页 20 条，5 页=100 条/源已远超一次搜索需要；
         // 取 50 时一次宽泛搜索会对单个源发几十个分页请求，电视端（多源 × 多联想关键词）直接卡死
         maxPages: 5,
+        // 这些头发给的是本站 /proxy/，不是采集源；UA 伪装由代理侧负责，
+        // 而且 fetch 的 User-Agent 是 forbidden header，写了也会被浏览器丢弃
         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept': 'application/json'
         }
     },
@@ -67,7 +68,6 @@ const API_CONFIG = {
         // 只拼接参数部分
         path: '?ac=videolist&ids=',
         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept': 'application/json'
         }
     }

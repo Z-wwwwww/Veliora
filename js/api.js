@@ -234,9 +234,6 @@ async function handleCustomApiSpecialDetail(id, customApi) {
             
         // 获取详情页HTML
         const response = await fetch(proxiedUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            },
             signal: controller.signal
         });
         
@@ -301,9 +298,6 @@ async function handleSpecialSourceDetail(id, sourceCode) {
             
         // 获取详情页HTML
         const response = await fetch(proxiedUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            },
             signal: controller.signal
         });
         
