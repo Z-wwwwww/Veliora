@@ -3,16 +3,21 @@ package org.veliora.television
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.KeyEvent
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import androidx.webkit.WebViewAssetLoader
 import org.json.JSONArray
 import org.json.JSONObject
@@ -24,24 +29,85 @@ class MainActivity : Activity() {
         private const val HOST = "appassets.androidplatform.net"
         private const val START_URL = "https://$HOST/index.html"
         private const val REQ_PLAYER = 1
+
+        // 注入脚本约定的应答值：拿不到它就认为渲染进程已经不在了
+        private const val JS_OK = "\"ok\""
+        // 正常情况 evaluateJavascript 回调是毫秒级的，超这么久基本等同渲染进程已死。
+        // 给到 2 秒是留给低端电视偶发的长任务，免得把活着的页面误判成死的
+        private const val JS_ALIVE_TIMEOUT_MS = 2000L
+
+        // 返回键：player.html 回选片页；页面内逐级返回；首页则退出 App。
+        // 末尾统一返回 'ok'，用于判断渲染进程是否还活着。
+        private const val JS_BACK = """
+            (function () {
+                if (location.pathname.indexOf('player.html') !== -1) {
+                    location.href = 'index.html';
+                    return 'ok';
+                }
+                var home = document.querySelector('.tv-view.active');
+                if (!home || home.id === 'viewHome') {
+                    if (window.AndroidTV) AndroidTV.exitApp();
+                    return 'ok';
+                }
+                document.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'Backspace', keyCode: 8, bubbles: true, cancelable: true
+                }));
+                return 'ok';
+            })();
+        """
     }
 
+    private lateinit var root: FrameLayout
     private lateinit var webView: WebView
+    private lateinit var assetLoader: WebViewAssetLoader
     private val proxy = ProxyHandler()
+    private val handler = Handler(Looper.getMainLooper())
 
     // 拦截到的 player.html 完整地址，供原生播放失败时回退 WebView 播放器
     private var pendingPlayerUrl: String? = null
 
-    @SuppressLint("SetJavaScriptEnabled")
+    // 重建 WebView 后要回到的页面（通常是首页；回退网页播放器时是 player.html）
+    private var lastPageUrl = START_URL
+    private var pageReady = false      // 当前文档已加载完（加载中不做探活，避免误判）
+    private var pageEverReady = false  // 这个 WebView 实例至少成功加载过一个页面
+
+    // 等待应答的探活序号（0 = 没有在等）。用序号而非布尔，旧回调就不会误判新一轮探活。
+    private var jsProbeSeq = 0
+    private var jsProbePending = 0
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        webView = WebView(this)
-        webView.setBackgroundColor(Color.BLACK)
-        webView.keepScreenOn = true // 视频应用常亮
-        setContentView(webView)
+        // assets/ 目录映射为 https://appassets.androidplatform.net/ —— 安全源，
+        // 保证 crypto.subtle 与 localStorage 可用（等价 server.mjs 的静态文件服务）
+        assetLoader = WebViewAssetLoader.Builder()
+            .setDomain(HOST)
+            .addPathHandler("/", WebViewAssetLoader.AssetsPathHandler(this))
+            .build()
 
-        webView.settings.apply {
+        // WebView 放在容器里而不是直接 setContentView：渲染进程被系统回收后要能整只换掉
+        root = FrameLayout(this)
+        root.setBackgroundColor(Color.BLACK)
+        setContentView(root)
+
+        webView = createWebView()
+        root.addView(webView, matchParent())
+        webView.requestFocus()
+        webView.loadUrl(START_URL)
+    }
+
+    private fun matchParent() = FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT,
+        FrameLayout.LayoutParams.MATCH_PARENT
+    )
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun createWebView(): WebView {
+        val wv = WebView(this)
+        wv.setBackgroundColor(Color.BLACK)
+        wv.keepScreenOn = true // 视频应用常亮
+
+        wv.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true                      // localStorage（源配置/播放进度/主题）
             mediaPlaybackRequiresUserGesture = false      // 遥控器点播直接起播
@@ -50,14 +116,7 @@ class MainActivity : Activity() {
             setSupportZoom(false)
         }
 
-        // assets/ 目录映射为 https://appassets.androidplatform.net/ —— 安全源，
-        // 保证 crypto.subtle 与 localStorage 可用（等价 server.mjs 的静态文件服务）
-        val assetLoader = WebViewAssetLoader.Builder()
-            .setDomain(HOST)
-            .addPathHandler("/", WebViewAssetLoader.AssetsPathHandler(this))
-            .build()
-
-        webView.webViewClient = object : WebViewClient() {
+        wv.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
                 view: WebView,
                 request: WebResourceRequest
@@ -83,16 +142,76 @@ class MainActivity : Activity() {
                 }
                 return false
             }
+
+            override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                pageReady = false
+                if (Uri.parse(url).host == HOST) lastPageUrl = url
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                pageReady = true
+                pageEverReady = true
+            }
+
+            /**
+             * 电视内存小，切到别的 App 后 WebView 的渲染进程常被系统回收。
+             * 不接这个回调整个 App 进程会被系统连带杀掉；接了但什么都不做则是黑屏 +
+             * 所有依赖注入 JS 的交互（返回键）全部失灵 —— 这里直接换一只新 WebView 自愈。
+             */
+            override fun onRenderProcessGone(
+                view: WebView,
+                detail: RenderProcessGoneDetail?
+            ): Boolean {
+                // 已经被换掉的旧实例（destroy 过了，别再动它），吃掉回调即可
+                if (view !== webView) return true
+                rebuildWebView()
+                return true
+            }
         }
 
         // JS 桥：页面在首页按返回键时通知原生退出
-        webView.addJavascriptInterface(object {
+        wv.addJavascriptInterface(object {
             @JavascriptInterface
             fun exitApp() = runOnUiThread { finish() }
         }, "AndroidTV")
 
+        return wv
+    }
+
+    /** 渲染进程死了之后原地换一只新 WebView，回到最近的页面 */
+    private fun rebuildWebView() {
+        jsProbePending = 0
+        val target = lastPageUrl
+        val dead = webView
+
+        root.removeView(dead)
+        dead.stopLoading()
+        dead.destroy()
+
+        pageReady = false
+        pageEverReady = false
+        webView = createWebView()
+        root.addView(webView, matchParent())
         webView.requestFocus()
-        webView.loadUrl(START_URL)
+        webView.loadUrl(target)
+    }
+
+    /**
+     * 执行页面脚本，并对「渲染进程已被回收」兜底：超时没等到约定应答就重建 WebView，
+     * 不让返回键这类完全依赖注入 JS 的交互变成死键。
+     */
+    private fun evalGuarded(js: String) {
+        val seq = ++jsProbeSeq
+        jsProbePending = seq
+        handler.postDelayed({
+            if (jsProbePending != seq) return@postDelayed
+            jsProbePending = 0
+            // 从没加载成功过（不是渲染进程的问题），重建也没意义，直接退出别把人困住
+            if (pageEverReady) rebuildWebView() else finish()
+        }, JS_ALIVE_TIMEOUT_MS)
+        webView.evaluateJavascript(js) { result ->
+            if (jsProbePending == seq && result == JS_OK) jsProbePending = 0
+        }
     }
 
     /**
@@ -169,24 +288,7 @@ class MainActivity : Activity() {
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         when (keyCode) {
             KeyEvent.KEYCODE_BACK -> {
-                webView.evaluateJavascript(
-                    """
-                    (function () {
-                        if (location.pathname.indexOf('player.html') !== -1) {
-                            location.href = 'index.html';
-                            return;
-                        }
-                        var home = document.querySelector('.tv-view.active');
-                        if (!home || home.id === 'viewHome') {
-                            if (window.AndroidTV) AndroidTV.exitApp();
-                            return;
-                        }
-                        document.dispatchEvent(new KeyboardEvent('keydown', {
-                            key: 'Backspace', keyCode: 8, bubbles: true, cancelable: true
-                        }));
-                    })();
-                    """.trimIndent(), null
-                )
+                evalGuarded(JS_BACK)
                 return true
             }
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
@@ -210,9 +312,16 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         webView.onResume()
+        webView.resumeTimers()
+        webView.requestFocus()
+        webView.invalidate()   // 个别电视机型回前台后不自动重绘
+        // 从别的 App 回来时渲染进程可能已经没了：先探活，死了就换新的，别把黑屏摆在用户面前
+        if (pageReady) evalGuarded("'ok';")
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        root.removeView(webView)
         webView.destroy()
         super.onDestroy()
     }

@@ -140,6 +140,14 @@ class PlayerActivity : Activity() {
     private var seekDirection = 0        // +1 快进 / -1 快退
     private var seekScanStartMs = 0L     // 进入连续扫描的时刻，0 = 尚未进入
 
+    // ---------- 后台/前台的断点 ----------
+    // 电视上硬解码器是独占的稀缺资源：切到别的播放类 App 会把它抢走，
+    // 我们若攥着不放，回前台时 surface 与解码器都已失效，只剩黑帧。
+    // 所以 onStop 记下断点后彻底释放，onStart 再原地重建续播。
+    private var resumeIndex = -1
+    private var resumePositionMs = -1L
+    private var resumePlayWhenReady = true
+
     private val seekLongPress = Runnable { startSeekScan() }
     private val seekCommit = Runnable { commitSeek() }
     private val seekScanTick = object : Runnable {
@@ -258,8 +266,7 @@ class PlayerActivity : Activity() {
             )
         )
         setContentView(root)
-
-        initPlayer()
+        // 播放器不在这里创建：交给 onStart，与 onStop 的释放成对（见 resumeIndex 注释）
     }
 
     private fun initPlayer() {
@@ -320,20 +327,24 @@ class PlayerActivity : Activity() {
             }
         })
 
-        val startIndex = intent.getIntExtra(EXTRA_INDEX, 0).coerceIn(0, episodes.size - 1)
+        // 后台释放前记下的断点优先（回前台要接着播），否则才是首次进入的续播逻辑
+        val fromBackground = resumePositionMs >= 0
+        val startIndex = (if (fromBackground) resumeIndex else intent.getIntExtra(EXTRA_INDEX, 0))
+            .coerceIn(0, episodes.size - 1)
         val extraPosMs = intent.getIntExtra(EXTRA_POSITION_SEC, 0) * 1000L
         val savedPosMs = savedProgress(episodes[startIndex])
         val startPosMs = when {
+            fromBackground -> resumePositionMs
             extraPosMs > MIN_RESUME_MS -> extraPosMs
             savedPosMs > 0 -> savedPosMs
             else -> C.TIME_UNSET
         }
 
         exo.setMediaItems(episodes.map(MediaItem::fromUri), startIndex, startPosMs)
-        exo.playWhenReady = true
+        exo.playWhenReady = resumePlayWhenReady
         exo.prepare()
 
-        if (startPosMs != C.TIME_UNSET && startPosMs > 0) {
+        if (!fromBackground && startPosMs != C.TIME_UNSET && startPosMs > 0) {
             Toast.makeText(this, "已从上次进度继续播放", Toast.LENGTH_SHORT).show()
         }
         showLoading()   // prepare 后立即进入加载态，避免起播前黑屏无反馈
@@ -688,14 +699,50 @@ class PlayerActivity : Activity() {
 
     // ---------- 生命周期 ----------
 
+    override fun onStart() {
+        super.onStart()
+        // episodes 为空时 onCreate 已 finish()，playerView 也没建起来，不能碰
+        if (player == null && episodes.isNotEmpty()) initPlayer()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 后台前是暂停态的话，回来先把控制条亮出来 —— 否则画面停在一帧，看着像卡死
+        if (player != null && !resumePlayWhenReady) playerView.showController()
+    }
+
     override fun onPause() {
         super.onPause()
         commitSeek()      // 攒着没提交的快进要先落点，否则存的是旧进度
         saveProgress()
-        player?.pause()
+        val exo = player ?: return
+        resumePlayWhenReady = exo.playWhenReady
+        exo.pause()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        releasePlayer()   // 记下断点后彻底放手解码器，回前台由 onStart 重建
     }
 
     override fun onDestroy() {
+        cancelPending()
+        releasePlayer()
+        super.onDestroy()
+    }
+
+    private fun releasePlayer() {
+        val exo = player ?: return
+        resumeIndex = exo.currentMediaItemIndex
+        resumePositionMs = exo.currentPosition.coerceAtLeast(0)
+        cancelPending()
+        hideLoading()
+        if (::playerView.isInitialized) playerView.player = null
+        player = null     // 先摘掉引用，release() 触发的回调就不会再碰这个实例
+        exo.release()
+    }
+
+    private fun cancelPending() {
         handler.removeCallbacks(hideOverlay)
         handler.removeCallbacks(okLongPress)
         handler.removeCallbacks(speedTicker)
@@ -703,9 +750,5 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(seekCommit)
         handler.removeCallbacks(seekScanTick)
         handler.removeCallbacks(hideSeekBox)
-        if (::playerView.isInitialized) playerView.player = null
-        player?.release()
-        player = null
-        super.onDestroy()
     }
 }
