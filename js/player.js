@@ -847,8 +847,8 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
                 callbacks.onSuccess = function (response, stats, context) {
                     // 如果是m3u8文件，处理内容以移除广告分段
                     if (response.data && typeof response.data === 'string') {
-                        // 过滤掉广告段 - 实现更精确的广告过滤逻辑
-                        response.data = filterAdsFromM3U8(response.data, true);
+                        // 相对分片路径要按重定向后的最终 URL 解析，才能比出异源广告块
+                        response.data = filterAdsFromM3U8(response.data, response.url || context.url);
                     }
                     return onSuccess(response, stats, context);
                 };
@@ -859,24 +859,139 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
     }
 }
 
-// 过滤可疑的广告内容
-function filterAdsFromM3U8(m3u8Content, strictMode = false) {
+// 过滤播放列表里的广告分片（与 android M3u8AdFilterDataSource.kt 的 M3u8AdFilter 同一套逻辑）
+//
+// ⚠️ #EXT-X-DISCONTINUITY 不可以直接删掉。
+// 它是「此处时间戳不连续，请重置时间基准」的信号：采集站中插的广告来自另一套转码，
+// PTS 和正片不在同一条时间轴上。删标记但保留分片（本函数最初的做法）等于让解析器
+// 按连续时间轴处理，撞到 PTS 大跳时会当成时间戳回卷去「纠正」，得到一堆废时间戳，
+// 播放位置永远等不到可播数据 —— 表现就是播到广告点反复缓冲、卡死不动，
+// 而且广告一片没删（老逻辑只删标记行，#EXTINF 和分片 URL 全留着），纯有害。
+//
+// 现在按 discontinuity 把列表切块，删掉判定为广告的整块分片，保留下来的块之间
+// 仍留一个 discontinuity 标记。判不准就整块留下 —— 有标记在播放至少是正确的，
+// 最坏结果只是广告照播。
+const MAX_AD_BLOCK_SEC = 180;   // 中插广告都是几十秒量级，比这更长的异源块宁可留着
+
+function filterAdsFromM3U8(m3u8Content, baseUrl) {
     if (!m3u8Content) return '';
+    // 主播放列表（只有 #EXT-X-STREAM-INF）与无广告分界的普通列表都原样返回
+    if (!m3u8Content.includes('#EXTINF')) return m3u8Content;
+    const rawLines = m3u8Content.split('\n').map(l => l.replace(/\r$/, ''));
+    // 注意 #EXT-X-DISCONTINUITY-SEQUENCE 也含这个前缀，只认独占一行的标记
+    const isDisc = l => l.trim() === '#EXT-X-DISCONTINUITY';
+    if (!rawLines.some(isDisc)) return m3u8Content;
 
-    // 按行分割M3U8内容
-    const lines = m3u8Content.split('\n');
-    const filteredLines = [];
+    const header = [];
+    const trailer = [];
+    const blocks = [[]];
+    let pendingTags = [];
+    let seenSegment = false;
 
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-
-        // 只过滤#EXT-X-DISCONTINUITY标识
-        if (!line.includes('#EXT-X-DISCONTINUITY')) {
-            filteredLines.push(line);
+    for (const line of rawLines) {
+        const t = line.trim();
+        if (!t) continue;
+        if (isDisc(t)) {
+            blocks.push([]);
+        } else if (t === '#EXT-X-ENDLIST') {
+            trailer.push(line);
+        } else if (t.startsWith('#')) {
+            if (seenSegment || t.startsWith('#EXTINF')) pendingTags.push(line);
+            else header.push(line);
+        } else {
+            seenSegment = true;
+            const extinf = pendingTags.find(l => l.trim().startsWith('#EXTINF'));
+            blocks[blocks.length - 1].push({
+                tags: pendingTags,
+                uri: t,
+                duration: extinf ? extinfDuration(extinf) : 0
+            });
+            pendingTags = [];
         }
     }
+    // 收尾时还挂着的标签（没有对应分片）跟着尾部一起输出，不丢内容
+    const dangling = pendingTags;
 
-    return filteredLines.join('\n');
+    const kept = blocks.filter(b => b.length > 0);
+    if (kept.length < 2) return m3u8Content;
+
+    const blockSec = b => b.reduce((s, seg) => s + seg.duration, 0);
+    // 正片目录的锚点：优先取播放列表自己所在的目录（正片分片绝大多数就放在它旁边），
+    // 分片另挂 CDN 导致一块都不在这个目录时，退化为「总时长最长那块」。
+    // 分片目录不同 = 另一套转码，几乎必是插进来的广告。
+    const selfDir = segmentDir('.', baseUrl);
+    const dirs = kept.map(b => blockDir(b, baseUrl));
+    const mainDir = dirs.includes(selfDir)
+        ? selfDir
+        : dirs[kept.indexOf(kept.reduce((a, b) => (blockSec(b) > blockSec(a) ? b : a)))];
+    // 正片目录得占住大头才敢动手：占不到就说明这个列表不符合「正片 + 中插广告」的形态
+    // （比如正片本身横跨多个目录），此时原样返回，宁可广告照播也不砍掉正片
+    const totalSec = kept.reduce((s, b) => s + blockSec(b), 0);
+    const mainSec = kept.reduce((s, b, i) => s + (dirs[i] === mainDir ? blockSec(b) : 0), 0);
+    if (totalSec > 0 && mainSec < totalSec * 0.6) return m3u8Content;
+
+    const out = [...header];
+    let droppedSegments = 0;
+    let droppedSec = 0;
+    let emittedBlock = false;
+    for (let i = 0; i < kept.length; i++) {
+        const block = kept[i];
+        const sec = blockSec(block);
+        const isAd = dirs[i] !== mainDir &&
+            sec <= MAX_AD_BLOCK_SEC &&
+            // 整块含密钥声明时不敢删：后面的分片可能依赖这次 #EXT-X-KEY 换钥
+            !block.some(seg => seg.tags.some(l => l.trim().startsWith('#EXT-X-KEY')));
+        if (isAd) {
+            droppedSegments += block.length;
+            droppedSec += sec;
+            continue;
+        }
+        // 块与块之间原本就有 discontinuity，保留它（多一个标记只是多一次时间基准重置，无害）
+        if (emittedBlock) out.push('#EXT-X-DISCONTINUITY');
+        emittedBlock = true;
+        for (const seg of block) {
+            out.push(...seg.tags, seg.uri);
+        }
+    }
+    // 一片广告都没删的话，原样返回，不做无谓的重写（空行、行尾都保持源站原貌）
+    if (droppedSegments === 0) return m3u8Content;
+    out.push(...dangling, ...trailer);
+
+    console.log(`已过滤广告分片 ${droppedSegments} 个 / ${Math.round(droppedSec)} 秒`);
+    return out.join('\n');
+}
+
+// #EXTINF:12.5,title → 12.5
+function extinfDuration(line) {
+    const v = parseFloat(line.slice(line.indexOf(':') + 1).split(',')[0]);
+    return isNaN(v) ? 0 : v;
+}
+
+// 块内分片所在目录（取出现最多的那个），用于区分正片与异源广告
+function blockDir(block, baseUrl) {
+    const counts = new Map();
+    for (const seg of block) {
+        const dir = segmentDir(seg.uri, baseUrl);
+        counts.set(dir, (counts.get(dir) || 0) + 1);
+    }
+    let best = '';
+    let bestCount = -1;
+    for (const [dir, n] of counts) {
+        if (n > bestCount) { best = dir; bestCount = n; }
+    }
+    return best;
+}
+
+function segmentDir(segUri, baseUrl) {
+    let abs = segUri;
+    try {
+        if (baseUrl) abs = new URL(segUri, baseUrl).href;
+    } catch (e) {
+        abs = segUri;   // 解析不了就按原样比，同源分片字面量本来也一致
+    }
+    const noQuery = abs.split('?')[0].split('#')[0];
+    const cut = noQuery.lastIndexOf('/');
+    return cut >= 0 ? noQuery.slice(0, cut) : noQuery;
 }
 
 

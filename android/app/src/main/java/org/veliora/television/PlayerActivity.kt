@@ -80,6 +80,17 @@ class PlayerActivity : Activity() {
         // 扫描硬上限：纯兜底（个别遥控器只发 DOWN 不发 UP）
         private const val SEEK_SCAN_MAX_MS = 30_000L
 
+        // ---------- 卡死自愈 ----------
+        // 采集源分片时不时会有一片下不下来（源站抽风 / 分片本身就是坏的），
+        // ExoPlayer 重试几轮仍拿不到数据就一直停在缓冲态，用户看到的就是「反复转圈」。
+        // 判定条件卡得很严：位置不动 + 这段时间内几乎一个字节都没收到 —— 只有真死才跳，
+        // 网速慢（有数据在进来）绝不触发，否则会把慢速用户的缓冲进度反复清掉。
+        private const val STALL_TIMEOUT_MS = 25_000L
+        private const val STALL_MIN_BYTES = 128 * 1024L
+        private const val STALL_TICK_MS = 1_000L
+        private const val STALL_SKIP_MS = 10_000L
+        private const val MAX_STALL_SKIPS = 3     // 每集最多跳这么多次，跳不动就不再折腾
+
         // 清晰度偏好（按分辨率高度记忆，0=自动；下划线前缀避免与进度存储的 URL 键冲突）
         private const val KEY_QUALITY = "__preferredQuality"
         private const val OK_LONG_PRESS_MS = 600L
@@ -120,6 +131,46 @@ class PlayerActivity : Activity() {
             lastRxBytes = rx
             lastRxTime = now
             handler.postDelayed(this, SPEED_INTERVAL_MS)
+        }
+    }
+
+    // ---------- 卡死自愈状态 ----------
+    private var stallSinceMs = 0L        // 本轮「位置不动」的起点，0 = 未在计时
+    private var stallPositionMs = 0L
+    private var stallRxAtStart = 0L
+    private var stallSkips = 0
+    private val stallChecker = object : Runnable {
+        override fun run() {
+            val exo = player
+            // 暂停中不算卡：用户自己按的
+            if (exo == null || exo.playbackState != Player.STATE_BUFFERING || !exo.playWhenReady) {
+                stallSinceMs = 0L
+                return
+            }
+            val now = android.os.SystemClock.elapsedRealtime()
+            val pos = exo.currentPosition
+            val rx = readRxBytes()
+            val stalledFor = now - stallSinceMs
+            val gotBytes = rx >= 0 && stallRxAtStart >= 0 && rx - stallRxAtStart >= STALL_MIN_BYTES
+            if (stallSinceMs == 0L || Math.abs(pos - stallPositionMs) > 500) {
+                stallSinceMs = now
+                stallPositionMs = pos
+                stallRxAtStart = rx
+            } else if (stalledFor >= STALL_TIMEOUT_MS && !gotBytes && stallSkips < MAX_STALL_SKIPS) {
+                val dur = exo.duration
+                val target = pos + STALL_SKIP_MS
+                if (dur <= 0 || target < dur - 1_000) {
+                    stallSkips++
+                    stallSinceMs = 0L
+                    exo.seekTo(target)
+                    Toast.makeText(
+                        this@PlayerActivity,
+                        "片源此处读不动，已跳过 ${STALL_SKIP_MS / 1000} 秒",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+            handler.postDelayed(this, STALL_TICK_MS)
         }
     }
 
@@ -293,6 +344,7 @@ class PlayerActivity : Activity() {
         exo.addListener(object : Player.Listener {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 currentVideoHeight = 0
+                stallSkips = 0    // 跳过次数按集算
                 showOverlayHint()
             }
 
@@ -309,9 +361,15 @@ class PlayerActivity : Activity() {
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 when (playbackState) {
-                    Player.STATE_BUFFERING -> showLoading()
+                    Player.STATE_BUFFERING -> {
+                        showLoading()
+                        startStallWatch()
+                    }
                     Player.STATE_ENDED -> finish() // 全部集数播完
-                    else -> hideLoading()
+                    else -> {
+                        hideLoading()
+                        stopStallWatch()
+                    }
                 }
             }
 
@@ -370,6 +428,17 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(speedTicker)
         lastRxTime = 0L
         loadingBox.visibility = View.GONE
+    }
+
+    private fun startStallWatch() {
+        stallSinceMs = 0L
+        handler.removeCallbacks(stallChecker)
+        handler.postDelayed(stallChecker, STALL_TICK_MS)
+    }
+
+    private fun stopStallWatch() {
+        handler.removeCallbacks(stallChecker)
+        stallSinceMs = 0L
     }
 
     private fun formatSpeed(bytesPerSec: Long): String = when {
@@ -750,5 +819,6 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(seekCommit)
         handler.removeCallbacks(seekScanTick)
         handler.removeCallbacks(hideSeekBox)
+        handler.removeCallbacks(stallChecker)
     }
 }
