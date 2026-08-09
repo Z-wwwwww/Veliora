@@ -388,6 +388,9 @@
         if (promptGate.active) { promptGate.onKey(e); return; }
         if (filterGate.active) { filterGate.onKey(e); return; }
         if (pwGate.active) { pwGate.onKey(e); return; }
+        // 加载遮罩盖着时按键归它（返回=取消加载）。onKey 返回 false 表示遮罩已经不在了，
+        // 那就当没这道门，按键继续往下走
+        if (loadingGate.active && loadingGate.onKey(e)) return;
 
         switch (e.key) {
             case 'ArrowUp':    e.preventDefault(); navigate('up'); break;
@@ -406,6 +409,22 @@
                 }
         }
     });
+
+    // Android 壳的返回键不经过浏览器 keydown，而是注入脚本调这里（见 MainActivity.JS_BACK）。
+    // 「这一下该退出 App 还是该关掉点什么」必须由页面判断：壳子自己只看 .tv-view.active 的话，
+    // 首页上盖着加载遮罩（或密码框、选项弹层）时按返回会把整个 App 退掉。
+    window.tvBack = function () {
+        const busy = optGate.active || promptGate.active || filterGate.active ||
+            pwGate.active || loadingGate.isUp();
+        if (busy || state.view !== 'home') {
+            // 交给上面那条统一链路：该关弹层的关弹层，该逐级返回的逐级返回
+            document.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Backspace', keyCode: 8, bubbles: true, cancelable: true
+            }));
+            return;
+        }
+        if (window.AndroidTV) AndroidTV.exitApp();   // 首页且无处可退，才是真的退出
+    };
 
     // 鼠标悬停也能获取焦点（兼容 PC 调试）
     document.addEventListener('mouseover', (e) => {
@@ -896,16 +915,24 @@
         if (!raw) { toast('请输入片名'); return; }
         if (!ensureVerified()) return;
         if (!getSources().length) { toast('没有可用采集源，请到「设置」中选择'); return; }
-        showLoading(hasCJK(raw) ? '搜索中…' : '正在联想片名…');
+        // gen：搜索期间用户按返回取消的话，后到的结果一律丢弃，不再把结果页顶出来
+        const gen = beginLoading(hasCJK(raw) ? '搜索中…' : '正在联想片名…');
         try {
             const { primary, fallback } = await buildSearchQueries(raw);
-            if (!hasCJK(raw)) renderSuggestChips(await resolveTitles(raw));   // 猜错时可直接点别的候选
+            if (loadingCancelled(gen)) return;
+            if (!hasCJK(raw)) {
+                const titles = await resolveTitles(raw);
+                if (loadingCancelled(gen)) return;
+                renderSuggestChips(titles);   // 猜错时可直接点别的候选
+            }
 
             let used = primary;
-            let list = await searchQueries(primary);
+            let list = await searchQueries(primary, gen);
+            if (loadingCancelled(gen)) return;
             if (!list.length && fallback.length) {     // 首选候选搜空了，再试次级候选
                 used = fallback;
-                list = await searchQueries(fallback);
+                list = await searchQueries(fallback, gen);
+                if (loadingCancelled(gen)) return;
             }
             // 只记真搜到东西的关键词，且记中文片名而不是 QYN 这种字母串，
             // 否则历史里全是联想歪了的词，点一次还是空
@@ -920,9 +947,12 @@
         }
     }
 
-    async function searchQueries(queries) {
+    async function searchQueries(queries, gen) {
         const cn = queries.filter(hasCJK);
-        showLoading(cn.length ? '搜索「' + cn.join('、') + '」…' : '搜索中…');
+        // 已被取消就别把遮罩重新亮起来
+        if (gen === undefined || !loadingCancelled(gen)) {
+            showLoading(cn.length ? '搜索「' + cn.join('、') + '」…' : '搜索中…');
+        }
         const lists = await Promise.all(queries.map(q => searchAll(q).catch(() => [])));
         return mergeResults(lists, cn[0] || queries[0]);
     }
@@ -1640,12 +1670,14 @@
         const box = document.getElementById('discResults');
         if (d.loading) return;
         d.loading = true;
+        // append 时不亮遮罩（滚到底自动续加载），也就无从取消
+        let gen = null;
         if (!append) {
             d.pageStart = 0;
             d.done = false;
             d.seen = new Set();
             document.getElementById('viewDiscover').scrollTop = 0;   // 新筛选从头看
-            showLoading('加载豆瓣推荐…');
+            gen = beginLoading('加载豆瓣推荐…');
         }
         try {
             const tagsParam = [d.form, ...d.tags].join(',');
@@ -1656,6 +1688,8 @@
                 (d.country ? `&countries=${encodeURIComponent(d.country)}` : '') +
                 `&start=${d.pageStart}`;
             const data = await fetchDoubanData(url);
+            // 已取消：结果直接丢弃，原来的网格内容保持不动
+            if (gen !== null && loadingCancelled(gen)) return;
             // 去重（豆瓣分页偶有条目重叠）
             const subs = ((data && data.data) || []).filter(it => {
                 const key = it.id || it.title;
@@ -1912,11 +1946,14 @@
     async function importConfigFromUrl() {
         const url = await promptGate.open('配置文件 URL', { charset: 'url' });
         if (!url) return;
-        showLoading('正在导入配置…');
+        const gen = beginLoading('正在导入配置…');
         try {
             const res = await fetch(url, { mode: 'cors', headers: { 'Accept': 'application/json' } });
+            if (loadingCancelled(gen)) return;         // 取消了就不落盘，也不 reload
             if (!res.ok) throw new Error('获取配置文件失败');
-            await applyImportedConfig(await res.json());
+            const json = await res.json();
+            if (loadingCancelled(gen)) return;
+            await applyImportedConfig(json);
         } catch (e) {
             toast('导入失败：' + e.message);
         } finally { hideLoading(); }
@@ -2037,6 +2074,33 @@
     // 注意：#loading 容器被密码门借用过（pwGate.open 会把里面的 spinner 结构整体换成密码键盘），
     // 验证成功前 #loadingMsg 是不存在的。这里必须容错重建，否则 showLoading 抛 TypeError，
     // 会把调用它的搜索/发现/详情整条流程静默中断（此前搜索点了没反应就是这个原因）。
+    // 加载遮罩是全屏的（.tv-center 铺满 inset:0），但它此前不吃按键：转圈期间按方向键是在
+    // 看不见的界面上挪焦点，按返回更是直接把底下那层界面退掉了 —— 用户看到的就是
+    // 「遮罩没关，被遮住的界面自己返回了」。所以比照 optGate / pwGate 把它也做成一道门。
+    const loadingGate = {
+        active: false,
+        // 取消时自增：仍在飞的请求回来后一对号，发现这轮已被放弃就不再渲染，
+        // 免得用户已经退出去了，几秒后结果又把界面顶掉
+        token: 0,
+        // 遮罩是不是真盖着：active 标志万一被异常路径漏掉，以 DOM 为准，别把 App 按死
+        isUp() {
+            const c = document.getElementById('loading');
+            return this.active && !!c && !c.classList.contains('hidden');
+        },
+        onKey(e) {
+            if (!this.isUp()) { this.active = false; return false; }   // 交还按键
+            e.preventDefault();
+            if (e.key === 'Backspace' || e.key === 'Escape' ||
+                e.key === 'GoBack' || e.key === 'BrowserBack') {
+                cancelLoading();
+            }
+            return true;   // 其余键一律吞掉：遮罩盖着时不该操作底下的界面
+        }
+    };
+    function beginLoading(msg) { showLoading(msg); return loadingGate.token; }
+    function loadingCancelled(gen) { return gen !== loadingGate.token; }
+    function cancelLoading() { loadingGate.token++; hideLoading(); }
+
     const LOADING_HTML = '<div class="tv-spinner"></div><div class="msg" id="loadingMsg">加载中…</div>';
     function showLoading(msg) {
         if (pwGate.active) return;                 // 密码门正开着，别把它盖掉
@@ -2046,8 +2110,10 @@
         if (!m) { c.innerHTML = LOADING_HTML; m = document.getElementById('loadingMsg'); }
         if (m) m.textContent = msg || '加载中…';
         c.classList.remove('hidden');
+        loadingGate.active = true;
     }
     function hideLoading() {
+        loadingGate.active = false;   // 早退分支也要落，否则按键会被一直吞掉
         if (pwGate.active) return;
         const c = document.getElementById('loading');
         if (c) c.classList.add('hidden');

@@ -36,7 +36,9 @@ class MainActivity : Activity() {
         // 给到 2 秒是留给低端电视偶发的长任务，免得把活着的页面误判成死的
         private const val JS_ALIVE_TIMEOUT_MS = 2000L
 
-        // 返回键：player.html 回选片页；页面内逐级返回；首页则退出 App。
+        // 返回键：player.html 回选片页；index.html 交给页面的 tvBack 决定这一下关什么。
+        // 「首页就退出 App」的判断不能放在这里：从壳子只能看到 .tv-view.active，看不见
+        // 首页上盖着的加载遮罩 / 密码框 / 弹层，按返回会越过它们直接把 App 退掉。
         // 末尾统一返回 'ok'，用于判断渲染进程是否还活着。
         private const val JS_BACK = """
             (function () {
@@ -44,8 +46,10 @@ class MainActivity : Activity() {
                     location.href = 'index.html';
                     return 'ok';
                 }
-                var home = document.querySelector('.tv-view.active');
-                if (!home || home.id === 'viewHome') {
+                if (window.tvBack) { window.tvBack(); return 'ok'; }
+                // 页面脚本还没跑起来（启动瞬间按返回）：退回老规则兜底
+                var v = document.querySelector('.tv-view.active');
+                if (!v || v.id === 'viewHome') {
                     if (window.AndroidTV) AndroidTV.exitApp();
                     return 'ok';
                 }
