@@ -868,9 +868,10 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
 // 播放位置永远等不到可播数据 —— 表现就是播到广告点反复缓冲、卡死不动，
 // 而且广告一片没删（老逻辑只删标记行，#EXTINF 和分片 URL 全留着），纯有害。
 //
-// 现在按 discontinuity 把列表切块，删掉判定为广告的整块分片，保留下来的块之间
-// 仍留一个 discontinuity 标记。判不准就整块留下 —— 有标记在播放至少是正确的，
-// 最坏结果只是广告照播。
+// 现在按 discontinuity 把列表切块，删掉判定为广告的整块分片。源站自己标的 discontinuity
+// 一律保留；被删广告两侧若是同目录且文件名连号的正片（同一次切片的连续编码），连标记一起
+// 抹掉，还原成没塞广告前的样子（多余标记会让播放器另起时间基准，音画错位、加载中反复闪）。
+// 判不准就整块留下 —— 有标记在播放至少是正确的，最坏结果只是广告照播。
 const MAX_AD_BLOCK_SEC = 180;   // 中插广告都是几十秒量级，比这更长的异源块宁可留着
 
 function filterAdsFromM3U8(m3u8Content, baseUrl) {
@@ -933,7 +934,9 @@ function filterAdsFromM3U8(m3u8Content, baseUrl) {
     const out = [...header];
     let droppedSegments = 0;
     let droppedSec = 0;
-    let emittedBlock = false;
+    let lastEmitted = null;        // 上一个保留块的最后一片
+    let lastEmittedDir = '';
+    let droppedSinceEmit = false;  // 上一个保留块之后是否删过广告块
     for (let i = 0; i < kept.length; i++) {
         const block = kept[i];
         const sec = blockSec(block);
@@ -944,14 +947,28 @@ function filterAdsFromM3U8(m3u8Content, baseUrl) {
         if (isAd) {
             droppedSegments += block.length;
             droppedSec += sec;
+            droppedSinceEmit = true;
             continue;
         }
-        // 块与块之间原本就有 discontinuity，保留它（多一个标记只是多一次时间基准重置，无害）
-        if (emittedBlock) out.push('#EXT-X-DISCONTINUITY');
-        emittedBlock = true;
+        if (lastEmitted) {
+            // 源站自己标的 discontinuity（两个保留块之间本来就没夹广告）原样保留。
+            // 只有在「删掉的广告把同一段正片切成了两半」时才把标记也一并抹掉：
+            // 正片两侧同目录且文件名连号（0000799.ts → 0000800.ts），就是同一次切片出来的
+            // 连续编码，时间戳本来就接得上，还原成没塞广告前的样子即可。
+            // 留着多余标记反而有害：播放器给后半段另起时间基准，正片音频在拼接处比预期早
+            // 一百多毫秒，不到音频重同步阈值却超过视频丢帧阈值，后半段视频帧全被当迟到丢掉，
+            // 解码飞快耗尽缓冲，表现为播到广告点后「加载中」快速反复闪。
+            const stitched = droppedSinceEmit &&
+                lastEmittedDir === mainDir && dirs[i] === mainDir &&
+                consecutiveSegmentNames(lastEmitted.uri, block[0].uri);
+            if (!stitched) out.push('#EXT-X-DISCONTINUITY');
+        }
         for (const seg of block) {
             out.push(...seg.tags, seg.uri);
         }
+        lastEmitted = block[block.length - 1];
+        lastEmittedDir = dirs[i];
+        droppedSinceEmit = false;
     }
     // 一片广告都没删的话，原样返回，不做无谓的重写（空行、行尾都保持源站原貌）
     if (droppedSegments === 0) return m3u8Content;
@@ -959,6 +976,21 @@ function filterAdsFromM3U8(m3u8Content, baseUrl) {
 
     console.log(`已过滤广告分片 ${droppedSegments} 个 / ${Math.round(droppedSec)} 秒`);
     return out.join('\n');
+}
+
+// 两个分片文件名是否连号：前缀 + 数字 + 扩展名，数字相差 1（0000799.ts → 0000800.ts）
+function consecutiveSegmentNames(prevUri, nextUri) {
+    const a = splitSegmentName(prevUri);
+    const b = splitSegmentName(nextUri);
+    return !!(a && b && a.prefix === b.prefix && a.ext === b.ext && b.num - a.num === 1);
+}
+
+// 取 URL 末段文件名，拆成 {prefix, num, ext}；没有数字则返回 null
+function splitSegmentName(uri) {
+    const name = uri.split('?')[0].split('#')[0].split('/').pop();
+    const m = /^(.*?)(\d+)(\.[A-Za-z0-9]+)?$/.exec(name);
+    if (!m) return null;
+    return { prefix: m[1], num: parseInt(m[2], 10), ext: m[3] || '' };
 }
 
 // #EXTINF:12.5,title → 12.5

@@ -21,8 +21,10 @@ import java.io.ByteArrayOutputStream
  * 播放位置永远等不到可播数据 —— 表现就是播到广告点反复缓冲、卡死不动，
  * 而且广告一片没删（老逻辑只删标记行，#EXTINF 和分片 URL 全留着），纯有害。
  *
- * 现在的做法：按 discontinuity 把播放列表切成块，删掉判定为广告的整块分片，
- * 保留下来的块之间仍留一个 discontinuity 标记（拼接处时间戳本来就可能不连续）。
+ * 现在的做法：按 discontinuity 把播放列表切成块，删掉判定为广告的整块分片。
+ * 源站自己标的 discontinuity 一律保留；被删广告两侧若是同目录且文件名连号的正片
+ * （同一次切片的连续编码），连标记一起抹掉，还原成没塞广告前的样子 —— 多余的标记
+ * 会让播放器另起时间基准，造成百毫秒级音画错位、视频帧全被丢弃、加载中反复闪。
  * 判不准就整块留下 —— 有标记在，播放至少是正确的，最坏结果只是广告照播。
  */
 @UnstableApi
@@ -160,7 +162,9 @@ internal object M3u8AdFilter {
         var droppedSec = 0.0
         val out = StringBuilder()
         header.forEach { out.append(it).append('\n') }
-        var emittedBlock = false
+        var lastEmitted: Segment? = null      // 上一个保留块的最后一片
+        var lastEmittedDir = ""
+        var droppedSinceEmit = false          // 上一个保留块之后是否删过广告块
         for ((i, block) in kept.withIndex()) {
             val dur = block.sumOf { it.durationSec }
             val isAd = dirs[i] != mainDir &&
@@ -170,15 +174,30 @@ internal object M3u8AdFilter {
             if (isAd) {
                 droppedSegments += block.size
                 droppedSec += dur
+                droppedSinceEmit = true
                 continue
             }
-            // 块与块之间原本就有 discontinuity，保留它（多一个标记只是多一次时间基准重置，无害）
-            if (emittedBlock) out.append(DISCONTINUITY).append('\n')
-            emittedBlock = true
+            if (lastEmitted != null) {
+                // 源站自己标的 discontinuity（两个保留块之间本来就没夹广告）原样保留。
+                // 只有在「删掉的广告把同一段正片切成了两半」时才把标记也一并抹掉：
+                // 正片两侧同目录且文件名连号（0000799.ts → 0000800.ts），就是同一次切片
+                // 出来的连续编码，时间戳本来就接得上，还原成没塞广告前的样子即可。
+                // 留着这个多余标记反而有害：播放器会给后半段另起时间基准，正片音频在
+                // 拼接处比预期早一百多毫秒 —— 不到 ExoPlayer 音频重同步阈值（200ms），
+                // 却超过视频丢帧阈值（30ms），于是后半段视频帧全部被当成迟到丢掉，
+                // 解码飞快耗尽缓冲，表现为播到广告点后「加载中」快速反复闪。
+                val stitched = droppedSinceEmit &&
+                    lastEmittedDir == mainDir && dirs[i] == mainDir &&
+                    consecutiveNames(lastEmitted.uri, block.first().uri)
+                if (!stitched) out.append(DISCONTINUITY).append('\n')
+            }
             for (seg in block) {
                 seg.tags.forEach { out.append(it).append('\n') }
                 out.append(seg.uri).append('\n')
             }
+            lastEmitted = block.last()
+            lastEmittedDir = dirs[i]
+            droppedSinceEmit = false
         }
         // 一片广告都没删的话，原样返回，不做无谓的重写（空行、行尾都保持源站原貌）
         if (droppedSegments == 0) return content
@@ -187,6 +206,23 @@ internal object M3u8AdFilter {
 
         Log.i(TAG, "过滤广告分片 $droppedSegments 个 / ${droppedSec.toInt()} 秒")
         return out.toString()
+    }
+
+    /** 两个分片文件名是否连号：prefix + 数字 + 扩展名，数字相差 1（0000799.ts → 0000800.ts） */
+    internal fun consecutiveNames(prevUri: String, nextUri: String): Boolean {
+        val a = splitName(prevUri) ?: return false
+        val b = splitName(nextUri) ?: return false
+        return a.first == b.first && a.third == b.third && b.second - a.second == 1L
+    }
+
+    private val NAME_RE = Regex("^(.*?)(\\d+)(\\.[A-Za-z0-9]+)?$")
+
+    /** 取 URL 末段文件名，拆成 (前缀, 数字, 扩展名)；没有数字则返回 null */
+    private fun splitName(uri: String): Triple<String, Long, String>? {
+        val name = uri.substringBefore('?').substringBefore('#').substringAfterLast('/')
+        val m = NAME_RE.matchEntire(name) ?: return null
+        val num = m.groupValues[2].toLongOrNull() ?: return null
+        return Triple(m.groupValues[1], num, m.groupValues[3])
     }
 
     /** #EXTINF:12.5,title → 12.5 */
