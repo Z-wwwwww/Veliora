@@ -2,6 +2,7 @@ package org.veliora.television
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -57,6 +58,10 @@ class PlayerActivity : Activity() {
         const val EXTRA_POSITION_SEC = "position" // 页面传来的续播秒数（可为 0）
         const val EXTRA_AD_FILTER = "adFilter"
         const val RESULT_FALLBACK = 9             // 原生播放失败 → MainActivity 回退 WebView 播放器
+        // 正常退出时带回给 MainActivity 的观看位置（RESULT_OK），页面据此更新观看历史
+        const val RESULT_EXTRA_INDEX = "index"
+        const val RESULT_EXTRA_POSITION_SEC = "positionSec"
+        const val RESULT_EXTRA_DURATION_SEC = "durationSec"
 
         private const val PREFS = "playbackProgress"
         private const val MIN_RESUME_MS = 10_000L   // 进度小于此值不续播
@@ -365,7 +370,7 @@ class PlayerActivity : Activity() {
                         showLoading()
                         startStallWatch()
                     }
-                    Player.STATE_ENDED -> finish() // 全部集数播完
+                    Player.STATE_ENDED -> { saveProgress(); finish() } // 全部集数播完
                     else -> {
                         hideLoading()
                         stopStallWatch()
@@ -391,10 +396,12 @@ class PlayerActivity : Activity() {
             .coerceIn(0, episodes.size - 1)
         val extraPosMs = intent.getIntExtra(EXTRA_POSITION_SEC, 0) * 1000L
         val savedPosMs = savedProgress(episodes[startIndex])
+        // 本机 SharedPreferences 里的断点一定比页面历史里的新（每次 onPause 都存），优先用它；
+        // 页面传来的 position 只在本机没记录时兜底（比如历史是网页播放器写的）
         val startPosMs = when {
             fromBackground -> resumePositionMs
-            extraPosMs > MIN_RESUME_MS -> extraPosMs
             savedPosMs > 0 -> savedPosMs
+            extraPosMs > MIN_RESUME_MS -> extraPosMs
             else -> C.TIME_UNSET
         }
 
@@ -670,7 +677,14 @@ class PlayerActivity : Activity() {
         if (idx !in episodes.indices) return
         val pos = exo.currentPosition
         val dur = exo.duration
-        if (dur <= 0 || pos < 5_000) return
+        if (dur <= 0) return
+        // 每次存断点顺带把结果更新好，finish() 时（返回键/全部播完）自然带回 MainActivity
+        setResult(RESULT_OK, Intent().apply {
+            putExtra(RESULT_EXTRA_INDEX, idx)
+            putExtra(RESULT_EXTRA_POSITION_SEC, (pos / 1000).toInt())
+            putExtra(RESULT_EXTRA_DURATION_SEC, (dur / 1000).toInt())
+        })
+        if (pos < 5_000) return
         val editor = prefs.edit()
         if (dur - pos < NEAR_END_MS) editor.remove(episodes[idx]) // 看完即清除续播点
         else editor.putString(episodes[idx], "$pos,$dur")

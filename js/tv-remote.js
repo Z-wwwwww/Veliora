@@ -363,7 +363,7 @@
 
     function goBack() {
         // 发现页深处按返回：弹出半透明筛选浮层，网格位置不动；
-        // 不改筛选直接返回/下键收起，焦点落回原卡片
+        // 浮层里再按返回＝离开发现页回主页（收起浮层不改筛选：在最下排按「下」）
         if (state.view === 'discover' && current && current.closest('#discResults')) {
             filterGate.open();
             return;
@@ -423,8 +423,18 @@
             }));
             return;
         }
-        if (window.AndroidTV) AndroidTV.exitApp();   // 首页且无处可退，才是真的退出
+        confirmExit();   // 首页且无处可退，才问要不要退出
     };
+
+    // 首页按返回不直接退 App：遥控器上返回键很容易多按一下，先弹确认。
+    // 确认框开着时 optGate.active 为真，再按返回走上面的 busy 分支＝取消。
+    async function confirmExit() {
+        const ok = await optGate.open('退出 Veliora？', [
+            { text: '取消', value: null },
+            { text: '退出', value: true, cls: 'warn' },
+        ]);
+        if (ok && window.AndroidTV) AndroidTV.exitApp();
+    }
 
     // 鼠标悬停也能获取焦点（兼容 PC 调试）
     document.addEventListener('mouseover', (e) => {
@@ -530,7 +540,10 @@
         return tile;
     }
 
-    // ---------- 观看历史页（顶栏时钟图标打开，返回键回主页；viewingHistory 由 player.js 写入，与主项目共享） ----------
+    // ---------- 观看历史页（顶栏时钟图标打开，返回键回主页） ----------
+    // viewingHistory 与主项目 player.js 同键同格式。但电视 App 里 player.html 被壳子拦下改走原生
+    // ExoPlayer，player.js 根本不会跑，所以历史必须由这里在起播时写入（见 recordHistory），
+    // 退出原生播放器时再由壳子回调 tvPlaybackReport 把看到哪一集、哪个位置写回去。
     function renderHistoryView() {
         const grid = document.getElementById('historyGrid');
         grid.innerHTML = '';
@@ -601,6 +614,77 @@
         } catch (e) {}
     }
 
+    // 同一部剧在历史里只留一条：标题 + 源 + 剧集标识（源_vod_id，没有 id 就用第一集直链）
+    function showIdentifierOf(sourceCode, vodId, episodes) {
+        if (sourceCode && vodId) return sourceCode + '_' + vodId;
+        return (episodes && episodes[0]) || '';
+    }
+    function sameShow(a, b) {
+        return a && b && a.title === b.title && (a.sourceCode || '') === (b.sourceCode || '') &&
+            (a.showIdentifier || '') === (b.showIdentifier || '');
+    }
+
+    // 起播时写一条历史（已有则更新并挪到最前）。字段与 player.js 的 addToViewingHistory 一致，
+    // 这样网页播放器兜底时写的记录和这里写的能互相识别
+    let lastPlayed = null;   // 正在原生播放器里播的那部：tvPlaybackReport 回来时按它找记录
+    function recordHistory({ title, episodes, episodeIndex, sourceCode, vodId, pic, position, showIdentifier }) {
+        const eps = Array.isArray(episodes) ? episodes.slice() : [];
+        const idx = episodeIndex || 0;
+        const entry = {
+            title: title || '',
+            directVideoUrl: eps[idx] || '',
+            url: '',
+            episodeIndex: idx,
+            sourceName: sourceCode ? sourceLabel(sourceCode) : '',
+            vod_id: vodId || '',
+            vod_pic: pic || '',
+            sourceCode: sourceCode || '',
+            showIdentifier: showIdentifier || showIdentifierOf(sourceCode, vodId, eps),
+            timestamp: Date.now(),
+            playbackPosition: position || 0,
+            duration: 0,
+            episodes: eps,
+        };
+        lastPlayed = { title: entry.title, sourceCode: entry.sourceCode, showIdentifier: entry.showIdentifier };
+        let history = store.get('viewingHistory', []);
+        if (!Array.isArray(history)) history = [];
+        const at = history.findIndex(h => sameShow(h, entry));
+        if (at !== -1) {
+            const old = history.splice(at, 1)[0];
+            // 接着看同一集：保留上次的进度/时长；换了集：进度从头算
+            if (old.episodeIndex === idx) {
+                entry.playbackPosition = entry.playbackPosition || old.playbackPosition || 0;
+                entry.duration = old.duration || 0;
+            }
+            entry.vod_pic = entry.vod_pic || old.vod_pic || '';
+            if (!eps.length && Array.isArray(old.episodes)) entry.episodes = old.episodes;
+        }
+        history.unshift(entry);
+        if (history.length > 50) history.length = 50;
+        store.set('viewingHistory', history);
+    }
+
+    // 原生播放器退出时由壳子回调（MainActivity.onActivityResult）：看到第几集、第几秒、总长几秒
+    window.tvPlaybackReport = function (index, posSec, durSec) {
+        if (!lastPlayed) return;
+        const history = store.get('viewingHistory', []);
+        const it = Array.isArray(history) ? history.find(h => sameShow(h, lastPlayed)) : null;
+        if (!it) return;
+        if (typeof index === 'number' && index >= 0) {
+            it.episodeIndex = index;
+            if (Array.isArray(it.episodes) && it.episodes[index]) it.directVideoUrl = it.episodes[index];
+        }
+        it.playbackPosition = Math.max(0, Math.floor(posSec || 0));
+        it.duration = Math.max(0, Math.floor(durSec || 0));
+        it.timestamp = Date.now();
+        store.set('viewingHistory', history);
+        // 正停在历史页（从这儿点进去播的）：卡片上的集数/进度条要跟着刷新
+        if (state.view === 'history') {
+            renderHistoryView();
+            setFocus(document.querySelector('#historyGrid .tv-tile') || document.getElementById('navHistory'));
+        }
+    };
+
     function resumeHistory(item) {
         if (!ensureVerified()) return;
         const eps = Array.isArray(item.episodes) ? item.episodes : [];
@@ -616,6 +700,11 @@
             localStorage.setItem('currentVideoTitle', item.title || '');
             localStorage.setItem('currentEpisodeIndex', String(idx));
         } catch (e) {}
+        recordHistory({
+            title: item.title, episodes: eps.length ? eps : [url], episodeIndex: idx,
+            sourceCode: item.sourceCode, vodId: item.vod_id, pic: item.vod_pic,
+            position: item.playbackPosition, showIdentifier: item.showIdentifier,   // 沿用旧记录的标识，别写成第二条
+        });
         const params = new URLSearchParams({
             url,
             title: item.title || '',
@@ -1350,12 +1439,18 @@
             localStorage.setItem('currentVideoTitle', title);
             localStorage.setItem('currentEpisodeIndex', String(index));
         } catch (e) {}
+        const pic = state.detail.doubanCover || (videoInfo && videoInfo.cover) || r.vod_pic || '';
+        recordHistory({
+            title, episodes, episodeIndex: index,
+            sourceCode: r.source_code, vodId: r.vod_id, pic,
+        });
         const params = new URLSearchParams({
             url: episodes[index],
             title: title,
             index: String(index),
             source: r.source_code || '',
-            pic: state.detail.doubanCover || (videoInfo && videoInfo.cover) || r.vod_pic || '',
+            id: r.vod_id || '',
+            pic,
             returnUrl: 'index.html'
         });
         window.location.href = 'player.html?' + params.toString();
@@ -1515,7 +1610,9 @@
     function saveUserTags(tags) { store.set(tagStoreKey(), tags); }
 
     // 筛选浮层：网格深处按返回时弹出，滚动位置与数据都不动；
-    // 不改筛选就收起（返回键，或在最下排继续按「下」）→ 焦点落回原卡片
+    // 在最下排继续按「下」＝不改筛选收起，焦点落回原卡片；
+    // 浮层里按返回＝回主页。之前返回也是「收起回卡片」，结果卡片上再按返回又弹浮层，
+    // 用户在发现页无论按多少次返回都出不去。
     const filterGate = {
         active: false, returnEl: null,
         open() {
@@ -1526,14 +1623,21 @@
             overlayEl = panel;
             setFocus(document.querySelector('#discForm .chip'), false);
         },
-        close() {
+        close(refocus = true) {
             this.active = false;
             overlayEl = null;
             document.getElementById('discFilters').classList.remove('overlay');
             // 筛选没变 → 原卡片还在，焦点直接落回去；变了（网格已重建）→ 回到新结果第一张
-            if (this.returnEl && document.contains(this.returnEl)) setFocus(this.returnEl);
-            else setFocus(document.querySelector('#discResults .tv-tile') || document.querySelector('#discForm .chip'));
+            if (refocus) {
+                if (this.returnEl && document.contains(this.returnEl)) setFocus(this.returnEl);
+                else setFocus(document.querySelector('#discResults .tv-tile') || document.querySelector('#discForm .chip'));
+            }
             this.returnEl = null;
+        },
+        // 返回键：收起浮层并离开发现页（焦点交给主页，不必落回卡片）
+        leave() {
+            this.close(false);
+            showView('home');
         },
         onKey(e) {
             switch (e.key) {
@@ -1549,7 +1653,7 @@
                 }
                 case 'Enter': e.preventDefault(); if (current) current.click(); break;
                 case 'Backspace': case 'Escape': case 'GoBack': case 'BrowserBack':
-                    e.preventDefault(); this.close(); break;
+                    e.preventDefault(); this.leave(); break;
             }
         }
     };

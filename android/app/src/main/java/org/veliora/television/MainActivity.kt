@@ -280,6 +280,16 @@ class MainActivity : Activity() {
             pendingPlayerUrl?.let { webView.loadUrl(it) }
             return
         }
+        if (requestCode == REQ_PLAYER && resultCode == RESULT_OK && data != null) {
+            // 原生播放器退出：把看到第几集/第几秒交给页面写进观看历史（页面还停在选片页，没被卸载）。
+            // 页面若恰好在重建（渲染进程被回收）则这一次丢掉，历史里仍有起播时写的那条
+            val idx = data.getIntExtra(PlayerActivity.RESULT_EXTRA_INDEX, -1)
+            val pos = data.getIntExtra(PlayerActivity.RESULT_EXTRA_POSITION_SEC, 0)
+            val dur = data.getIntExtra(PlayerActivity.RESULT_EXTRA_DURATION_SEC, 0)
+            webView.evaluateJavascript(
+                "window.tvPlaybackReport && window.tvPlaybackReport($idx, $pos, $dur);", null
+            )
+        }
         super.onActivityResult(requestCode, resultCode, data)
     }
 
