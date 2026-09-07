@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.res.ColorStateList
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
 import android.net.TrafficStats
 import android.os.Bundle
 import android.os.Handler
@@ -44,8 +46,8 @@ import androidx.media3.ui.PlayerView
  * - 左/右：按一下快退/快进 15 秒（连按累加）；按住转为连续扫描，倍速 8x→…→256x 递增
  *   （按片长封顶，整片最快 12 秒扫完），松手才落点。全程底部显示进度条 + 目标时间 + 倍速。
  *   OK：暂停/继续并唤出控制条
- * - 上/下：唤出控制条（内含上一集/下一集/进度条，方向键导航）
- * - 菜单键 / 长按 OK：清晰度选择（仅多码率源），手动锁档并记忆偏好
+ * - 上/下 / 菜单键 / 长按 OK：唤出功能区（控制条 + 清晰度、跳过片头片尾按钮，方向键导航）
+ *   菜单键再按一次收起，与返回键收起功能区一致
  * - 返回：控制条可见则先收起，否则退出回到选片页
  */
 @OptIn(UnstableApi::class)
@@ -96,9 +98,25 @@ class PlayerActivity : Activity() {
         private const val STALL_SKIP_MS = 10_000L
         private const val MAX_STALL_SKIPS = 3     // 每集最多跳这么多次，跳不动就不再折腾
 
+        // ---------- 跳过片头片尾 ----------
+        // 不做自动识别：采集源是边播边解的 HLS，没有跨集预分析音视频指纹的地方，
+        // 误判代价还高。改由用户在播放设置里定一次，按剧名记住，同剧其余集自动套用。
+        private const val KEY_SKIP_ENABLED = "__skipEnabled"
+        private const val KEY_SKIP_INTRO_DEFAULT = "__skipIntroDefault"
+        private const val KEY_SKIP_OUTRO_DEFAULT = "__skipOutroDefault"
+        private const val PREFIX_SKIP_INTRO = "__skipIntro:"
+        private const val PREFIX_SKIP_OUTRO = "__skipOutro:"
+        private val SKIP_PRESETS_SEC = intArrayOf(0, 30, 60, 90, 120, 180)
+        private const val SKIP_TICK_MS = 1_000L
+        // 起播这么久内才算「从头开播」：续播断点若正落在片头里，那是用户上次停的地方，别抢
+        private const val SKIP_START_GRACE_MS = 5_000L
+
         // 清晰度偏好（按分辨率高度记忆，0=自动；下划线前缀避免与进度存储的 URL 键冲突）
         private const val KEY_QUALITY = "__preferredQuality"
         private const val OK_LONG_PRESS_MS = 600L
+        // 功能区按钮行离底边的高度：要抬到 Media3 控制条（时间 + 进度条 + 按钮）上方
+        private const val FUNCTION_BAR_BOTTOM_DP = 120
+        private const val FUNCTION_BAR_KEEP_MS = 2_000L
         private const val SPEED_INTERVAL_MS = 500L
     }
 
@@ -110,6 +128,12 @@ class PlayerActivity : Activity() {
     private lateinit var seekBox: LinearLayout
     private lateinit var seekText: TextView
     private lateinit var seekBar: ProgressBar
+    // 功能区：控制条上方那排功能按钮（控制条本身只有上一集/下一集/进度条）
+    private lateinit var functionBar: LinearLayout
+    private lateinit var qualityButton: TextView
+    private lateinit var skipSwitchButton: TextView
+    private lateinit var introButton: TextView
+    private lateinit var outroButton: TextView
     private lateinit var prefs: SharedPreferences
     private var player: ExoPlayer? = null
     private var episodes: List<String> = emptyList()
@@ -179,6 +203,19 @@ class PlayerActivity : Activity() {
         }
     }
 
+    // ---------- 跳过片头片尾状态 ----------
+    private var skipEnabled = true
+    private var skipIntroSec = 0          // 片头时长（秒），0 = 不跳
+    private var skipOutroSec = 0          // 片尾时长（距结尾的秒数，各集长度不一也通用），0 = 不跳
+    private var pendingIntroSkip = false  // 本集片头还没判定过（每集只判一次，用户自己倒回片头不再抢）
+    private var outroHandledIndex = -1    // 已跳过片尾的集下标，防止在片尾区间里反复触发
+    private val skipChecker = object : Runnable {
+        override fun run() {
+            checkSkipSegments()
+            handler.postDelayed(this, SKIP_TICK_MS)
+        }
+    }
+
     // ---------- 清晰度 ----------
     private data class QualityOption(val group: Tracks.Group, val trackIndex: Int, val height: Int, val bitrate: Int)
 
@@ -186,7 +223,7 @@ class PlayerActivity : Activity() {
     private var manualQualityHeight = 0   // 手动锁定的分辨率高度，0=自动（自适应）
     private var currentVideoHeight = 0    // 实际在播的分辨率高度（用于浮层显示）
     private var okLongPressFired = false
-    private val okLongPress = Runnable { okLongPressFired = true; openQualityDialog() }
+    private val okLongPress = Runnable { okLongPressFired = true; playerView.showController() }
 
     // ---------- 快进/快退状态 ----------
     // seekTargetMs >= 0 表示正在攒一次 seek：期间只更新目标点与浮层，不真的 seek。
@@ -230,6 +267,7 @@ class PlayerActivity : Activity() {
             return
         }
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        loadSkipSettings()
 
         playerView = PlayerView(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -275,6 +313,27 @@ class PlayerActivity : Activity() {
             visibility = View.GONE
         }
 
+        qualityButton = barButton { openQualityDialog() }
+        skipSwitchButton = barButton {
+            skipEnabled = !skipEnabled
+            prefs.edit().putBoolean(KEY_SKIP_ENABLED, skipEnabled).apply()
+            refreshFunctionBar()
+            toast(if (skipEnabled) "已开启自动跳过片头片尾" else "已关闭自动跳过片头片尾")
+        }
+        introButton = barButton { openSkipDialog(true) }
+        outroButton = barButton { openSkipDialog(false) }
+        functionBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            listOf(qualityButton, skipSwitchButton, introButton, outroButton).forEach {
+                addView(it, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { rightMargin = 18 })
+            }
+        }
+
         loadingBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -313,6 +372,23 @@ class PlayerActivity : Activity() {
                 Gravity.BOTTOM
             ).apply { setMargins(70, 0, 70, 60) }
         )
+        // 功能区跟控制条一起显隐：上/下、菜单键唤出，返回键收起，二者始终成套出现
+        root.addView(
+            functionBar,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.START
+            ).apply {
+                setMargins(70, 0, 70, (FUNCTION_BAR_BOTTOM_DP * resources.displayMetrics.density).toInt())
+            }
+        )
+        playerView.setControllerVisibilityListener(
+            PlayerView.ControllerVisibilityListener { visibility ->
+                functionBar.visibility = visibility
+                if (visibility == View.VISIBLE) refreshFunctionBar()
+            }
+        )
         root.addView(
             loadingBox,
             FrameLayout.LayoutParams(
@@ -350,11 +426,13 @@ class PlayerActivity : Activity() {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 currentVideoHeight = 0
                 stallSkips = 0    // 跳过次数按集算
+                pendingIntroSkip = true
                 showOverlayHint()
             }
 
             override fun onTracksChanged(tracks: Tracks) {
                 rebuildQualityOptions(tracks)
+                refreshFunctionBar()
             }
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
@@ -412,6 +490,10 @@ class PlayerActivity : Activity() {
         if (!fromBackground && startPosMs != C.TIME_UNSET && startPosMs > 0) {
             Toast.makeText(this, "已从上次进度继续播放", Toast.LENGTH_SHORT).show()
         }
+        pendingIntroSkip = true
+        outroHandledIndex = -1
+        handler.removeCallbacks(skipChecker)
+        handler.post(skipChecker)
         showLoading()   // prepare 后立即进入加载态，避免起播前黑屏无反馈
         showOverlayHint()
     }
@@ -639,7 +721,157 @@ class PlayerActivity : Activity() {
         exo.trackSelectionParameters = builder.build()
         manualQualityHeight = opt?.height ?: 0
         if (save) prefs.edit().putInt(KEY_QUALITY, manualQualityHeight).apply()
+        refreshFunctionBar()
     }
+
+    // ---------- 功能区 ----------
+
+    private fun barButton(onClick: () -> Unit): TextView {
+        val focused = GradientDrawable().apply {
+            cornerRadius = 14f
+            setColor(Color.parseColor("#E50914"))
+        }
+        val normal = GradientDrawable().apply {
+            cornerRadius = 14f
+            setColor(0xA6000000.toInt())
+        }
+        return TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            setPadding(30, 16, 30, 16)
+            isFocusable = true
+            background = StateListDrawable().apply {
+                addState(intArrayOf(android.R.attr.state_focused), focused)
+                addState(intArrayOf(), normal)
+            }
+            setOnClickListener { onClick() }
+            setOnFocusChangeListener { _, hasFocus ->
+                if (hasFocus) {
+                    handler.removeCallbacks(keepFunctionBar)
+                    handler.post(keepFunctionBar)
+                }
+            }
+        }
+    }
+
+    // 焦点在功能区上时不断给控制条续命，否则 4 秒超时会把整个功能区收走
+    private val keepFunctionBar = object : Runnable {
+        override fun run() {
+            if (functionBar.visibility == View.VISIBLE && functionBar.hasFocus()) {
+                playerView.showController()
+                handler.postDelayed(this, FUNCTION_BAR_KEEP_MS)
+            }
+        }
+    }
+
+    private fun refreshFunctionBar() {
+        if (!::functionBar.isInitialized) return
+        qualityButton.text = "清晰度：" + when {
+            qualityOptions.size <= 1 -> "仅一档"
+            manualQualityHeight == 0 -> "自动"
+            else -> qualityOptions.firstOrNull { it.height == manualQualityHeight }
+                ?.let { qualityLabel(it) } ?: "自动"
+        }
+        skipSwitchButton.text = "自动跳过：" + if (skipEnabled) "开" else "关"
+        introButton.text = "片头：" + skipLabel(skipIntroSec)
+        outroButton.text = "片尾：" + skipLabel(skipOutroSec)
+    }
+
+    // ---------- 跳过片头片尾 ----------
+
+    private fun loadSkipSettings() {
+        skipEnabled = prefs.getBoolean(KEY_SKIP_ENABLED, true)
+        // 全局默认只对多集内容生效：电影就一集，套用「片头 90 秒」会直接切掉开场
+        val multi = episodes.size > 1
+        skipIntroSec = prefs.getInt(PREFIX_SKIP_INTRO + videoTitle,
+            if (multi) prefs.getInt(KEY_SKIP_INTRO_DEFAULT, 0) else 0)
+        skipOutroSec = prefs.getInt(PREFIX_SKIP_OUTRO + videoTitle,
+            if (multi) prefs.getInt(KEY_SKIP_OUTRO_DEFAULT, 0) else 0)
+    }
+
+    private fun checkSkipSegments() {
+        val exo = player ?: return
+        val dur = exo.duration
+        if (dur <= 0) return          // 时长还没解析出来（或直播）时不判，没有参照系
+        val idx = exo.currentMediaItemIndex
+        val pos = exo.currentPosition
+
+        if (pendingIntroSkip) {
+            pendingIntroSkip = false
+            val introMs = skipIntroSec * 1000L
+            // 片头点必须落在前半段：短片被套上长片头设置时宁可不跳
+            if (skipEnabled && introMs in 1 until dur / 2 && pos < SKIP_START_GRACE_MS) {
+                exo.seekTo(introMs)
+                toast("已跳过片头 $skipIntroSec 秒")
+                return
+            }
+        }
+
+        // 暂停时不切集：用户自己按停在片尾（看演职员表/彩蛋）就别抢
+        val outroMs = skipOutroSec * 1000L
+        if (skipEnabled && exo.playWhenReady && outroMs in 1 until dur / 2 &&
+            idx != outroHandledIndex && pos >= dur - outroMs
+        ) {
+            outroHandledIndex = idx
+            if (exo.hasNextMediaItem()) {
+                if (idx in episodes.indices) prefs.edit().remove(episodes[idx]).apply() // 本集算看完
+                exo.seekToNextMediaItem()
+                toast("已跳过片尾，播放下一集")
+            } else {
+                // 最后一集：走到结尾，交给 STATE_ENDED 的既有流程收尾（清断点 + 退出）
+                exo.seekTo((dur - 500).coerceAtLeast(0))
+                toast("已跳过片尾")
+            }
+        }
+    }
+
+    private fun skipLabel(sec: Int) = if (sec <= 0) "不跳过" else "$sec 秒"
+
+    // intro=true 设片头（从头算起），false 设片尾（距结尾算起）
+    private fun openSkipDialog(intro: Boolean) {
+        val current = if (intro) skipIntroSec else skipOutroSec
+        // 「用当前进度设定」：正片刚开始（或片尾刚起）时按一下，比凭空猜秒数准
+        val exo = player
+        val dur = exo?.duration ?: 0L
+        val pos = exo?.currentPosition ?: 0L
+        val fromNowSec =
+            if (dur <= 0 || pos <= 0) null
+            else (((if (intro) pos else dur - pos) / 1000).toInt())
+                .takeIf { it in 1 until (dur / 2000).toInt() }
+
+        val presets = SKIP_PRESETS_SEC.toMutableList()
+        if (current > 0 && current !in presets) presets.add(current)
+        presets.sort()
+        val labels = presets.map { skipLabel(it) }.toMutableList()
+        if (fromNowSec != null) labels.add("用当前进度设定（$fromNowSec 秒）")
+        AlertDialog.Builder(this)
+            .setTitle(if (intro) "跳过片头" else "跳过片尾")
+            .setSingleChoiceItems(labels.toTypedArray(), presets.indexOf(current)) { dialog, which ->
+                dialog.dismiss()
+                applySkip(intro, if (which < presets.size) presets[which] else (fromNowSec ?: 0))
+            }
+            .setOnDismissListener { playerView.showController() }
+            .show()
+    }
+
+    private fun applySkip(intro: Boolean, sec: Int) {
+        val key = (if (intro) PREFIX_SKIP_INTRO else PREFIX_SKIP_OUTRO) + videoTitle
+        val defKey = if (intro) KEY_SKIP_INTRO_DEFAULT else KEY_SKIP_OUTRO_DEFAULT
+        // 本剧记住，同时作为「新剧集默认」：换一部多集内容直接沿用，不用每部重设
+        val editor = prefs.edit().putInt(key, sec).putInt(defKey, sec)
+        if (intro) skipIntroSec = sec else skipOutroSec = sec
+        outroHandledIndex = -1
+        if (sec > 0 && !skipEnabled) {   // 关着总开关又来设秒数，显然是想用
+            skipEnabled = true
+            editor.putBoolean(KEY_SKIP_ENABLED, true)
+        }
+        editor.apply()
+        refreshFunctionBar()
+        val what = if (intro) "片头" else "片尾"
+        toast(if (sec <= 0) "已关闭跳过$what" else "已设为跳过$what $sec 秒，本剧其余集自动套用")
+    }
+
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
     private fun openQualityDialog() {
         if (qualityOptions.size <= 1) {
@@ -657,6 +889,7 @@ class PlayerActivity : Activity() {
                 showOverlayHint()
                 dialog.dismiss()
             }
+            .setOnDismissListener { playerView.showController() }
             .show()
     }
 
@@ -739,8 +972,10 @@ class PlayerActivity : Activity() {
         if (event.action != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
 
         when (event.keyCode) {
+            // 菜单键唤出功能区，再按一次收起（与返回键收起功能区一致）
             KeyEvent.KEYCODE_MENU -> {
-                openQualityDialog()
+                if (playerView.isControllerFullyVisible) playerView.hideController()
+                else playerView.showController()
                 return true
             }
             KeyEvent.KEYCODE_BACK -> {
@@ -834,5 +1069,7 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(seekScanTick)
         handler.removeCallbacks(hideSeekBox)
         handler.removeCallbacks(stallChecker)
+        handler.removeCallbacks(skipChecker)
+        handler.removeCallbacks(keepFunctionBar)
     }
 }

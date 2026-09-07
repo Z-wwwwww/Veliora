@@ -396,6 +396,156 @@ function showShortcutHint(text, direction) {
     }, 2000);
 }
 
+// ---------- 跳过片头片尾 ----------
+// 时间点不做自动识别：源是边播边解的 HLS，没有跨集预分析音视频指纹的地方，误判代价还高。
+// 改由用户在播放器设置里定一次，按剧名记住，同剧其余集自动套用；总开关单独存。
+const SKIP_PRESETS = [0, 30, 60, 90, 120, 180];
+let outroSkipped = false;   // 本集片尾已处理，防止在片尾区间里反复触发
+let skipConfig = { intro: 0, outro: 0 };   // 本片生效的设置，起播/改设置时刷新
+
+function isSkipEnabled() {
+    return localStorage.getItem('skipSegmentsEnabled') !== 'false';   // 默认开（没设秒数时本就不动）
+}
+
+function readSkipMap() {
+    try {
+        return JSON.parse(localStorage.getItem('skipSegments') || '{}');
+    } catch (e) {
+        return {};
+    }
+}
+
+function getSkipConfig() {
+    const own = readSkipMap()[currentVideoTitle];
+    if (own) return { intro: own.intro || 0, outro: own.outro || 0 };
+    // 全局默认只对多集内容生效：电影就一集，套用「片头 90 秒」会直接切掉开场
+    if (currentEpisodes.length > 1) {
+        try {
+            const def = JSON.parse(localStorage.getItem('skipSegmentsDefault') || '{}');
+            return { intro: def.intro || 0, outro: def.outro || 0 };
+        } catch (e) {
+        }
+    }
+    return { intro: 0, outro: 0 };
+}
+
+function setSkipConfig(kind, sec) {
+    const cfg = getSkipConfig();
+    cfg[kind] = sec;
+    const map = readSkipMap();
+    map[currentVideoTitle] = cfg;
+    try {
+        localStorage.setItem('skipSegments', JSON.stringify(map));
+        // 同时作为「新剧集默认」：换一部多集内容直接沿用，不用每部重设
+        localStorage.setItem('skipSegmentsDefault', JSON.stringify(cfg));
+        if (sec > 0 && !isSkipEnabled()) localStorage.setItem('skipSegmentsEnabled', 'true');
+    } catch (e) {
+    }
+    skipConfig = cfg;
+    outroSkipped = false;
+}
+
+function skipLabel(sec) {
+    return sec > 0 ? sec + ' 秒' : '不跳过';
+}
+
+// 起播（或切集）后按设置跳过片头。续播断点优先，那是用户上次停的地方，不抢
+function applyIntroSkip() {
+    if (!art || !isSkipEnabled()) return;
+    const intro = skipConfig.intro;
+    const duration = art.duration || 0;
+    // 片头点必须落在前半段：短片被套上长片头设置时宁可不跳
+    if (intro > 0 && duration > 0 && intro < duration / 2) {
+        art.currentTime = intro;
+        showToast('已跳过片头 ' + intro + ' 秒', 'info');
+    }
+}
+
+// 播到片尾点：能续播下一集就切，否则走到结尾交给既有的 video:ended 流程
+function checkOutroSkip() {
+    if (!art || outroSkipped || !isSkipEnabled()) return;
+    const outro = skipConfig.outro;
+    const duration = art.duration || 0;
+    const position = art.currentTime || 0;
+    if (outro <= 0 || duration <= 0 || outro >= duration / 2) return;
+    if (position < duration - outro) return;
+    outroSkipped = true;
+    if (autoplayEnabled && currentEpisodeIndex < currentEpisodes.length - 1) {
+        showToast('已跳过片尾，播放下一集', 'info');
+        clearVideoProgress();
+        playNextEpisode();
+    } else {
+        showToast('已跳过片尾', 'info');
+        art.currentTime = Math.max(0, duration - 0.5);
+    }
+}
+
+// 构建"跳过片头片尾"设置菜单（总开关 + 片头/片尾秒数）
+function setupSkipSelector() {
+    if (!art || !art.setting) return;
+
+    function selectorOf(kind) {
+        const current = getSkipConfig()[kind];
+        const values = SKIP_PRESETS.slice();
+        if (current > 0 && values.indexOf(current) === -1) values.push(current);
+        values.sort(function (a, b) { return a - b; });
+        const selector = values.map(function (v) {
+            return { html: skipLabel(v), value: v, default: v === current };
+        });
+        // 正片刚开始（或片尾刚起）时选它，比凭空猜秒数准
+        selector.push({ html: '用当前进度设定', value: -1, default: false });
+        return selector;
+    }
+
+    function onSelect(kind, name) {
+        return function (item) {
+            let sec = item.value;
+            if (sec === -1) {
+                const duration = art.duration || 0;
+                const position = art.currentTime || 0;
+                sec = Math.round(kind === 'intro' ? position : duration - position);
+                if (!duration || sec <= 0 || sec >= duration / 2) {
+                    showToast('当前进度不适合设为' + name, 'warning');
+                    return skipLabel(getSkipConfig()[kind]);
+                }
+            }
+            setSkipConfig(kind, sec);
+            showToast(sec > 0
+                ? '已设为跳过' + name + ' ' + sec + ' 秒，本剧其余集自动套用'
+                : '已关闭跳过' + name, 'success');
+            return skipLabel(sec);
+        };
+    }
+
+    art.setting.update({
+        name: 'skip-toggle',
+        html: '自动跳过片头片尾',
+        switch: isSkipEnabled(),
+        onSwitch: function (item) {
+            const next = !item.switch;
+            localStorage.setItem('skipSegmentsEnabled', next ? 'true' : 'false');
+            showToast(next ? '已开启自动跳过片头片尾' : '已关闭自动跳过片头片尾', 'info');
+            return next;
+        }
+    });
+    art.setting.update({
+        name: 'skip-intro',
+        html: '片头',
+        width: 220,
+        tooltip: skipLabel(getSkipConfig().intro),
+        selector: selectorOf('intro'),
+        onSelect: onSelect('intro', '片头')
+    });
+    art.setting.update({
+        name: 'skip-outro',
+        html: '片尾',
+        width: 220,
+        tooltip: skipLabel(getSkipConfig().outro),
+        selector: selectorOf('outro'),
+        onSelect: onSelect('outro', '片尾')
+    });
+}
+
 // 构建"清晰度"设置菜单，支持手动锁定 HLS 档位
 function setupQualitySelector(hls) {
     if (!art || !art.setting) return;
@@ -714,6 +864,7 @@ function initPlayer(videoUrl) {
     // 播放器加载完成后初始隐藏工具栏
     art.on('ready', () => {
         hideControls();
+        setupSkipSelector();
     });
 
     // 全屏 Web 模式处理
@@ -729,6 +880,9 @@ function initPlayer(videoUrl) {
     art.on('video:loadedmetadata', function() {
         document.getElementById('player-loading').style.display = 'none';
         videoHasEnded = false; // 视频加载时重置结束标志
+        outroSkipped = false;  // 片尾跳过按集算
+        skipConfig = getSkipConfig();
+        let positionRestored = false;
         // 优先使用URL传递的position参数
         const urlParams = new URLSearchParams(window.location.search);
         const savedPosition = parseInt(urlParams.get('position') || '0');
@@ -736,6 +890,7 @@ function initPlayer(videoUrl) {
         if (savedPosition > 10 && savedPosition < art.duration - 2) {
             // 如果URL中有有效的播放位置参数，直接使用它
             art.currentTime = savedPosition;
+            positionRestored = true;
             showPositionRestoreHint(savedPosition);
         } else {
             // 否则尝试从本地存储恢复播放进度
@@ -751,12 +906,16 @@ function initPlayer(videoUrl) {
                         progress.position < art.duration - 2
                     ) {
                         art.currentTime = progress.position;
+                        positionRestored = true;
                         showPositionRestoreHint(progress.position);
                     }
                 }
             } catch (e) {
             }
         }
+
+        // 没有续播点才跳片头：有断点说明用户上次就停在那，别抢
+        if (!positionRestored) applyIntroSkip();
 
         // 设置进度条点击监听
         setupProgressBarPreciseClicks();
@@ -767,6 +926,9 @@ function initPlayer(videoUrl) {
         // 启动定期保存播放进度
         startProgressSaveInterval();
     })
+
+    // 播放中盯着片尾点
+    art.on('video:timeupdate', checkOutroSkip);
 
     // 错误处理
     art.on('video:error', function (error) {
@@ -1146,6 +1308,7 @@ function playEpisode(index) {
     currentEpisodeIndex = index;
     currentVideoUrl = url;
     videoHasEnded = false; // 重置视频结束标志
+    outroSkipped = false;  // 片尾跳过按集算
 
     clearVideoProgress();
 
