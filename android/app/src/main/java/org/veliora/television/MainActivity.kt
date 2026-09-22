@@ -29,6 +29,8 @@ class MainActivity : Activity() {
         private const val HOST = "appassets.androidplatform.net"
         private const val START_URL = "https://$HOST/index.html"
         private const val REQ_PLAYER = 1
+        private const val SHELL_PREFS = "veliora_shell"
+        private const val KEY_PENDING_REPORT = "pendingReport"
 
         // 注入脚本约定的应答值：拿不到它就认为渲染进程已经不在了
         private const val JS_OK = "\"ok\""
@@ -70,6 +72,13 @@ class MainActivity : Activity() {
     // 拦截到的 player.html 完整地址，供原生播放失败时回退 WebView 播放器
     private var pendingPlayerUrl: String? = null
 
+    // 原生播放器带回的「看到第几集 / 第几秒」。以前是 onActivityResult 里直接
+    // evaluateJavascript 一次就算了，送不到就丢：电视内存小，原生播放器在前台时 WebView 的
+    // 渲染进程十有八九已被系统回收，页面正在重建（或还没 onResume），这一下根本没人接，
+    // 于是观看历史永远停在起播那一集。改成攒下来（并落盘，进程被杀也不丢），
+    // 等页面确实能跑脚本了再送，收到应答才算送达。
+    private var pendingReport: String? = null
+
     // 重建 WebView 后要回到的页面（通常是首页；回退网页播放器时是 player.html）
     private var lastPageUrl = START_URL
     private var pageReady = false      // 当前文档已加载完（加载中不做探活，避免误判）
@@ -78,6 +87,9 @@ class MainActivity : Activity() {
     // 等待应答的探活序号（0 = 没有在等）。用序号而非布尔，旧回调就不会误判新一轮探活。
     private var jsProbeSeq = 0
     private var jsProbePending = 0
+
+    // Activity 是否在前台（不在前台就先不送回报，等 onResume，见 pendingReport）
+    private var resumed = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -94,10 +106,22 @@ class MainActivity : Activity() {
         root.setBackgroundColor(Color.BLACK)
         setContentView(root)
 
+        // 上次在播放器里被系统杀掉时没送达的回报，这次启动补上（页面加载完即送）
+        pendingReport = getSharedPreferences(SHELL_PREFS, MODE_PRIVATE)
+            .getString(KEY_PENDING_REPORT, null)
+
         webView = createWebView()
         root.addView(webView, matchParent())
         webView.requestFocus()
         webView.loadUrl(START_URL)
+    }
+
+    /** 播放回报的暂存：写盘后即使 App 在播放器里被系统杀掉，下次启动也能把历史补正 */
+    private fun setPendingReport(js: String?) {
+        pendingReport = js
+        val ed = getSharedPreferences(SHELL_PREFS, MODE_PRIVATE).edit()
+        if (js == null) ed.remove(KEY_PENDING_REPORT) else ed.putString(KEY_PENDING_REPORT, js)
+        ed.apply()
     }
 
     private fun matchParent() = FrameLayout.LayoutParams(
@@ -155,6 +179,7 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView, url: String) {
                 pageReady = true
                 pageEverReady = true
+                flushPlaybackReport()   // 渲染进程被回收时攒下的回报，页面回来了就补上
             }
 
             /**
@@ -282,13 +307,13 @@ class MainActivity : Activity() {
         }
         if (requestCode == REQ_PLAYER && resultCode == RESULT_OK && data != null) {
             // 原生播放器退出：把看到第几集/第几秒交给页面写进观看历史（页面还停在选片页，没被卸载）。
-            // 页面若恰好在重建（渲染进程被回收）则这一次丢掉，历史里仍有起播时写的那条
+            // 页面若在重建（渲染进程被回收），等它加载完再补报 —— 页面那边把「正在播的那部」
+            // 也存在 localStorage 里，重建后照样认得出该更新哪条记录
             val idx = data.getIntExtra(PlayerActivity.RESULT_EXTRA_INDEX, -1)
             val pos = data.getIntExtra(PlayerActivity.RESULT_EXTRA_POSITION_SEC, 0)
             val dur = data.getIntExtra(PlayerActivity.RESULT_EXTRA_DURATION_SEC, 0)
-            webView.evaluateJavascript(
-                "window.tvPlaybackReport && window.tvPlaybackReport($idx, $pos, $dur);", null
-            )
+            setPendingReport("window.tvPlaybackReport && window.tvPlaybackReport($idx, $pos, $dur);")
+            flushPlaybackReport()
         }
         super.onActivityResult(requestCode, resultCode, data)
     }
@@ -320,13 +345,28 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         super.onPause()
+        resumed = false
         webView.onPause()
+    }
+
+    /**
+     * 页面已就绪且 WebView 不在暂停态时，把攒着的播放回报交给页面（历史里的集数/进度靠它更新）。
+     * 收到约定应答才算送达就清空：渲染进程已死时收不到，留着等重建后的 onPageFinished 再补一次。
+     */
+    private fun flushPlaybackReport() {
+        val js = pendingReport ?: return
+        if (!pageReady || !resumed) return
+        webView.evaluateJavascript("$js 'ok';") { result ->
+            if (result == JS_OK) setPendingReport(null)
+        }
     }
 
     override fun onResume() {
         super.onResume()
+        resumed = true
         webView.onResume()
         webView.resumeTimers()
+        flushPlaybackReport()   // onActivityResult 早于这里，那时 WebView 还是暂停态
         webView.requestFocus()
         webView.invalidate()   // 个别电视机型回前台后不自动重绘
         // 从别的 App 回来时渲染进程可能已经没了：先探活，死了就换新的，别把黑屏摆在用户面前

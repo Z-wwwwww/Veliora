@@ -16,6 +16,7 @@
         view: 'home',              // home | discover | search | detail | settings | history
         query: '',
         detail: null,              // { title, results:[搜索结果...], selectedIdx, episodes:[], videoInfo }
+        detailFrom: '',            // 详情页是从哪个视图进来的（返回键据此回去，如历史页）
         discover: { form: '电影', genre: '', country: '', sort: 'U', tags: [], pageStart: 0, delMode: false,
                     loading: false, done: false, seen: new Set() },
         homeStale: false,          // 设置里改了影响首页的开关后置位
@@ -374,7 +375,9 @@
             setFocus(document.querySelector('#keyboard .key'));
             return;
         }
-        if (state.view === 'detail') { showView(state.query ? 'search' : 'home'); }
+        if (state.view === 'detail') {
+            showView(state.detailFrom === 'history' ? 'history' : (state.query ? 'search' : 'home'));
+        }
         else if (state.view !== 'home') { showView('home'); }
         else { /* home：无处可退 */ }
     }
@@ -580,7 +583,7 @@
                 </div>
                 <div class="cw-progress" style="width:${pct}%"></div>
             </div>`;
-        tile.onclick = () => resumeHistory(item);
+        tile.onclick = () => openHistoryDetail(item);
         return tile;
     }
 
@@ -626,7 +629,11 @@
 
     // 起播时写一条历史（已有则更新并挪到最前）。字段与 player.js 的 addToViewingHistory 一致，
     // 这样网页播放器兜底时写的记录和这里写的能互相识别
-    let lastPlayed = null;   // 正在原生播放器里播的那部：tvPlaybackReport 回来时按它找记录
+    // 正在原生播放器里播的那部：tvPlaybackReport 回来时按它找记录。必须落盘——电视内存小，
+    // 原生播放器在前台时 WebView 渲染进程常被系统回收，页面一重建内存里的这份就没了，
+    // 回报的集数/进度会被整个丢掉（历史于是永远停在起播那一集）
+    const LAST_PLAYED_KEY = 'tvLastPlayed';
+    let lastPlayed = store.get(LAST_PLAYED_KEY, null);
     function recordHistory({ title, episodes, episodeIndex, sourceCode, vodId, pic, position, showIdentifier }) {
         const eps = Array.isArray(episodes) ? episodes.slice() : [];
         const idx = episodeIndex || 0;
@@ -646,6 +653,7 @@
             episodes: eps,
         };
         lastPlayed = { title: entry.title, sourceCode: entry.sourceCode, showIdentifier: entry.showIdentifier };
+        store.set(LAST_PLAYED_KEY, lastPlayed);
         let history = store.get('viewingHistory', []);
         if (!Array.isArray(history)) history = [];
         const at = history.findIndex(h => sameShow(h, entry));
@@ -666,6 +674,7 @@
 
     // 原生播放器退出时由壳子回调（MainActivity.onActivityResult）：看到第几集、第几秒、总长几秒
     window.tvPlaybackReport = function (index, posSec, durSec) {
+        if (!lastPlayed) lastPlayed = store.get(LAST_PLAYED_KEY, null);
         if (!lastPlayed) return;
         const history = store.get('viewingHistory', []);
         const it = Array.isArray(history) ? history.find(h => sameShow(h, lastPlayed)) : null;
@@ -683,15 +692,31 @@
             renderHistoryView();
             setFocus(document.querySelector('#historyGrid .tv-tile') || document.getElementById('navHistory'));
         }
+        // 正停在选集页（从历史点进来的常态）：把「上次看到」的标记挪到刚看完的那一集
+        else if (state.view === 'detail' && state.detail) {
+            state.detail.resumeIndex = it.episodeIndex;
+            const d = state.detail;
+            if (Array.isArray(d.episodes) && d.episodes.length && d.results[d.selectedIdx]) {
+                renderEpisodes(d.episodes, d.results[d.selectedIdx]);
+            }
+        }
     };
 
-    function resumeHistory(item) {
+    // 点历史记录不再直接开播，而是进这部剧的选集页：能换源、能挑集数，
+    // 播完按返回也落在选集页（而不是被甩回历史页）。选集页会预选历史里那个源，
+    // 并把上次看到的那一集标出来、焦点直接落上去。
+    function openHistoryDetail(item) {
         if (!ensureVerified()) return;
-        const eps = Array.isArray(item.episodes) ? item.episodes : [];
         const idx = item.episodeIndex || 0;
+        if (item.title) {
+            openDetailByTitle(item.title, item.vod_pic, idx, item.sourceCode || '');
+            return;
+        }
+        // 连片名都没有的老记录：没法搜，只能照旧直接播
+        const eps = Array.isArray(item.episodes) ? item.episodes : [];
         const url = eps[idx] || item.directVideoUrl;
         if (!url) {
-            if (item.url) { window.location.href = item.url; return; }
+            if (item.url) { window.location.href = item.url; return; }   // 网页播放器写的老记录
             toast('该记录缺少播放地址');
             return;
         }
@@ -705,7 +730,7 @@
             sourceCode: item.sourceCode, vodId: item.vod_id, pic: item.vod_pic,
             position: item.playbackPosition, showIdentifier: item.showIdentifier,   // 沿用旧记录的标识，别写成第二条
         });
-        const params = new URLSearchParams({
+        window.location.href = 'player.html?' + new URLSearchParams({
             url,
             title: item.title || '',
             index: String(idx),
@@ -714,8 +739,7 @@
             id: item.vod_id || '',
             pic: item.vod_pic || '',
             returnUrl: 'index.html'
-        });
-        window.location.href = 'player.html?' + params.toString();
+        }).toString();
     }
 
     // ============================================================
@@ -1211,18 +1235,24 @@
     // 通过标题搜索后进入详情（用于豆瓣卡片）；cover 为豆瓣封面，详情页优先复用其高清版
     // 立即进入详情页：每个源先显示灰色加载中药丸，各自搜索完成后变为可选，无结果则移除
     let detailToken = 0;
-    async function openDetailByTitle(title, cover) {
+    // resumeIndex: 上次看到第几集（历史入口传入，用于标记并把焦点落上去）
+    // preferSource: 优先选中的源（历史入口传入，即上次看的那个源）
+    async function openDetailByTitle(title, cover, resumeIndex, preferSource) {
         state.query = title || '';
         if (!ensureVerified()) return;
         const sources = getSources();
         if (!sources.length) { toast('没有可用采集源，请到「设置」中选择'); return; }
+        if (state.view !== 'detail') state.detailFrom = state.view;
 
         const token = ++detailToken;
         state.detail = {
             results: [], selectedIdx: -1,
             doubanCover: hdCover(cover) || '',
             pendingSources: sources.map(sourceLabel),
-            fuzzy: []   // 非精确同名结果，全部源无精确匹配时兜底
+            fuzzy: [],  // 非精确同名结果，全部源无精确匹配时兜底
+            resumeIndex: typeof resumeIndex === 'number' ? resumeIndex : -1,
+            preferSource: (preferSource && sources.includes(preferSource)) ? preferSource : '',
+            waitFor: (preferSource && sources.includes(preferSource)) ? preferSource : '',
         };
         showView('detail');
         // 先用豆瓣信息占位，剧集区等首个源返回后填充
@@ -1238,6 +1268,7 @@
             searchByAPIAndKeyWord(src, title).catch(() => []).then(list => {
                 if (token !== detailToken) return;   // 已打开其他详情或离开
                 const d = state.detail;
+                if (d.waitFor === src) d.waitFor = '';   // 想等的那个源已经有结论了（有结果或没结果）
                 const li = d.pendingSources.indexOf(sourceLabel(src));
                 if (li >= 0) d.pendingSources.splice(li, 1);
                 const usable = applyYellowFilter(list || []);
@@ -1252,24 +1283,38 @@
                         toast('未找到可播放的片源');
                     }
                 }
+                // 想等的源没等来（超时/无结果），别干等着：用先到的源顶上
+                if (d.selectedIdx === -1 && d.results.length && !d.waitFor) {
+                    d.selectedIdx = 0;
+                    loadEpisodes(0);
+                }
                 renderSourceTabs();
             });
         });
     }
 
-    // 追加结果药丸；首批到达时自动选中并加载剧集
+    // 追加结果药丸；首批到达时自动选中并加载剧集。
+    // 从历史进来时指定了源：先到的别的源先不认（免得刚进页面加载了别的源的剧集，
+    // 等想要的源返回又跳一次），等它返回或确定没结果再决定
     function addDetailResults(items) {
         const d = state.detail;
-        const first = !d.results.length;
         d.results.push(...items);
-        if (first) { d.selectedIdx = 0; loadEpisodes(0); }
+        if (d.selectedIdx === -1) {
+            const at = d.preferSource
+                ? d.results.findIndex(i => (i.source_code || '') === d.preferSource)
+                : 0;
+            if (at >= 0) { d.selectedIdx = at; loadEpisodes(at); }
+            else if (!d.waitFor) { d.selectedIdx = 0; loadEpisodes(0); }
+        }
         renderSourceTabs();
     }
 
     // results: 同一影片的多个源结果，作为「播放源」切换（搜索结果页入口）
     async function openDetail(results, idx, doubanCover) {
         detailToken++;   // 使仍在进行的按标题搜索失效
-        state.detail = { results, selectedIdx: idx, doubanCover: doubanCover || '', pendingSources: [], fuzzy: [] };
+        if (state.view !== 'detail') state.detailFrom = state.view;
+        state.detail = { results, selectedIdx: idx, doubanCover: doubanCover || '', pendingSources: [], fuzzy: [],
+                         resumeIndex: -1, preferSource: '', waitFor: '' };
         showView('detail');
         renderSourceTabs();
         await loadEpisodes(idx);
@@ -1359,15 +1404,20 @@
         }
         const order = [...episodes.keys()];
         if (epReversed) order.reverse();
+        const resumeIdx = (state.detail && state.detail.resumeIndex);
+        let resumeEl = null;
         order.forEach(i => {
             const ep = document.createElement('div');
             ep.className = 'ep focusable';
             if (episodes.length === 1) ep.innerHTML = icon('play') + ' 播放';
             else ep.textContent = '第' + (i + 1) + '集';
+            if (i === resumeIdx) { ep.classList.add('resume'); resumeEl = ep; }
             ep.onclick = () => play(i, r);
             wrap.appendChild(ep);
         });
-        setTimeout(() => setFocus(document.querySelector('#sourceTabs .source-tab.selected') || wrap.querySelector('.ep')), 50);
+        // 从历史进来的：焦点直接落在上次看到的那一集，按 OK 就接着看
+        setTimeout(() => setFocus(resumeEl
+            || document.querySelector('#sourceTabs .source-tab.selected') || wrap.querySelector('.ep')), 50);
     }
 
     function updateEpOrderBtn() {
@@ -1418,7 +1468,11 @@
         if (!eps.length) { toast('该源暂无可播放剧集，剧集还在加载或此源无内容'); return; }
         const title = (d.videoInfo && d.videoInfo.title) || r.vod_name || state.query;
         let idx = 0;
-        if (eps.length > 1) {
+        // 从历史进来的：那条记录看到第几集是最准的，直接用
+        if (eps.length > 1 && d.resumeIndex > 0 && d.resumeIndex < eps.length) {
+            idx = d.resumeIndex;
+            toast('继续播放 第' + (idx + 1) + '集');
+        } else if (eps.length > 1) {
             const last = store.get('viewingHistory', [])
                 .filter(h => h && h.title === title && typeof h.episodeIndex === 'number')
                 .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))[0];
@@ -1440,14 +1494,25 @@
             localStorage.setItem('currentEpisodeIndex', String(index));
         } catch (e) {}
         const pic = state.detail.doubanCover || (videoInfo && videoInfo.cover) || r.vod_pic || '';
+        const showIdentifier = showIdentifierOf(r.source_code, r.vod_id, episodes);
+        // 历史里这部剧刚好停在这一集：带上断点接着看（原生播放器优先用本机断点，
+        // 这个参数是给网页播放器兜底用的）
+        const hist = store.get('viewingHistory', []);
+        const prev = Array.isArray(hist)
+            ? hist.find(h => sameShow(h, { title, sourceCode: r.source_code || '', showIdentifier }))
+            : null;
+        const position = (prev && prev.episodeIndex === index)
+            ? Math.floor(prev.playbackPosition || 0) : 0;
+        state.detail.resumeIndex = index;   // 播完回到本页时「上次看到」标记就落在这一集
         recordHistory({
             title, episodes, episodeIndex: index,
-            sourceCode: r.source_code, vodId: r.vod_id, pic,
+            sourceCode: r.source_code, vodId: r.vod_id, pic, position, showIdentifier,
         });
         const params = new URLSearchParams({
             url: episodes[index],
             title: title,
             index: String(index),
+            position: String(position),
             source: r.source_code || '',
             id: r.vod_id || '',
             pic,
@@ -1993,6 +2058,8 @@
             ]);
             if (!ok) return;
             localStorage.removeItem('viewingHistory');
+            localStorage.removeItem(LAST_PLAYED_KEY);
+            lastPlayed = null;
             toast('观看历史已清空');
         }, 'warn', 'del'));
         box.appendChild(chipBtn('清空搜索历史', () => {
